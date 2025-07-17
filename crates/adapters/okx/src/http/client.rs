@@ -1035,12 +1035,16 @@ impl OKXHttpClient {
             match cursor_mode {
                 "after" => {
                     if let Some(ref cursor) = cursor_value {
-                        builder.after(cursor.clone());
+                        if let Ok(cursor_i64) = cursor.parse::<i64>() {
+                            builder.after_ms(cursor_i64);
+                        }
                     }
                 }
                 "before" => {
                     if let Some(ref cursor) = cursor_value {
-                        builder.before(cursor.clone());
+                        if let Ok(cursor_i64) = cursor.parse::<i64>() {
+                            builder.before_ms(cursor_i64);
+                        }
                     }
                 }
                 "none" => {
@@ -1087,10 +1091,13 @@ impl OKXHttpClient {
             let mut page_bars = Vec::with_capacity(page.len());
             let ts_init = self.generate_ts_init();
 
+            // IMPORTANT: Use the original bar_type parameter to ensure BarType identity
+            // matches what was registered with DataTester. Creating a new BarType here
+            // (even with identical fields) would cause hash lookup failures downstream.
             for raw in &page {
                 let bar = parse_candlestick(
                     raw,
-                    bar_type,
+                    bar_type, // Use original BarType to maintain identity consistency
                     inst.price_precision(),
                     inst.size_precision(),
                     ts_init,

@@ -20,6 +20,7 @@ import pandas as pd
 from nautilus_trader.common.actor import Actor
 from nautilus_trader.common.config import ActorConfig
 from nautilus_trader.common.config import PositiveInt
+from nautilus_trader.common.enums import ComponentState
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.model.book import OrderBook
 from nautilus_trader.model.data import Bar
@@ -225,3 +226,39 @@ class DataTester(Actor):
         Actions to be performed when the actor is running and receives a bar.
         """
         self.log.info(repr(bar), LogColor.CYAN)
+
+    def handle_bar(self, bar: Bar) -> None:
+        """
+        Handle the given bar data with defensive shutdown-aware logging.
+
+        This override provides different log levels based on component state to
+        distinguish between genuine bugs and benign shutdown race conditions:
+        - RUNNING: ERROR (genuine unknown bar type bug)
+        - STOPPING/STOPPED: DEBUG (benign late packet during shutdown)
+        - STARTUP/INITIALIZING: DEBUG (subscription map not ready)
+
+        Parameters
+        ----------
+        bar : Bar
+            The bar received.
+
+        """
+        bar_type = bar.bar_type
+        topic = f"data.bars.{bar_type.standard()}"
+
+        # Check if we have an active subscription for this bar type
+        if not self._msgbus.has_subscribers(topic):
+            state = self.state()
+            if state == ComponentState.RUNNING:
+                self.log.error(
+                    f"Received <Bar> data for unknown bar type {bar_type} while RUNNING",
+                    LogColor.RED,
+                )
+            elif state in (ComponentState.STOPPING, ComponentState.STOPPED):
+                self.log.debug(f"Late bar received after unsubscribe - ignoring: {bar_type}")
+            elif state in (ComponentState.STARTUP, ComponentState.INITIALIZING):
+                self.log.debug(f"Bar arrived before subscription ready: {bar_type}")
+            return
+
+        # Call the parent implementation for normal processing
+        super().handle_bar(bar)

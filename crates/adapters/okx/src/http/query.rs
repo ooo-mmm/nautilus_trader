@@ -19,6 +19,7 @@ use serde::{self, Deserialize, Serialize};
 use crate::common::enums::{
     OKXInstrumentType, OKXOrderStatus, OKXPositionMode, OKXPositionSide, OKXTradeMode,
 };
+use crate::http::error::BuildError;
 
 #[allow(dead_code)] // Under development
 fn serialize_string_vec<S>(values: &Option<Vec<String>>, serializer: S) -> Result<S::Ok, S::Error>
@@ -111,24 +112,111 @@ pub struct GetTradesParams {
 }
 
 /// Parameters for the GET /api/v5/market/history-candles endpoint.
-#[derive(Clone, Debug, Deserialize, Serialize, Default, Builder)]
-#[builder(default)]
-#[builder(setter(into, strip_option))]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetCandlesticksParams {
     /// Instrument ID, e.g. "BTC-USDT".
     pub inst_id: String,
     /// Time interval, e.g. "1m", "5m", "1H".
     pub bar: String,
-    /// Pagination: fetch records after this timestamp.
+    /// Pagination: fetch records after this timestamp (milliseconds).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub after: Option<String>,
-    /// Pagination: fetch records before this timestamp.
+    #[serde(rename = "after")]
+    pub after_ms: Option<i64>,
+    /// Pagination: fetch records before this timestamp (milliseconds).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub before: Option<String>,
+    #[serde(rename = "before")]
+    pub before_ms: Option<i64>,
     /// Maximum number of records to return (default 100, max 300 for regular candles, max 100 for history).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+}
+
+/// Builder for GetCandlesticksParams with validation.
+#[derive(Debug, Default)]
+pub struct GetCandlesticksParamsBuilder {
+    inst_id: Option<String>,
+    bar: Option<String>,
+    after_ms: Option<i64>,
+    before_ms: Option<i64>,
+    limit: Option<u32>,
+}
+
+impl GetCandlesticksParamsBuilder {
+    /// Set the instrument ID.
+    pub fn inst_id(&mut self, inst_id: impl Into<String>) -> &mut Self {
+        self.inst_id = Some(inst_id.into());
+        self
+    }
+
+    /// Set the bar interval.
+    pub fn bar(&mut self, bar: impl Into<String>) -> &mut Self {
+        self.bar = Some(bar.into());
+        self
+    }
+
+    /// Set the after timestamp (milliseconds).
+    pub fn after_ms(&mut self, after_ms: i64) -> &mut Self {
+        self.after_ms = Some(after_ms);
+        self
+    }
+
+    /// Set the before timestamp (milliseconds).
+    pub fn before_ms(&mut self, before_ms: i64) -> &mut Self {
+        self.before_ms = Some(before_ms);
+        self
+    }
+
+    /// Set the limit.
+    pub fn limit(&mut self, limit: u32) -> &mut Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Build the parameters with embedded invariant validation.
+    pub fn build(&mut self) -> Result<GetCandlesticksParams, BuildError> {
+        // Extract values from builder
+        let inst_id = self.inst_id.clone().ok_or(BuildError::MissingInstId)?;
+        let bar = self.bar.clone().ok_or(BuildError::MissingBar)?;
+        let after_ms = self.after_ms;
+        let before_ms = self.before_ms;
+        let limit = self.limit;
+
+        // ───────── Cursor mutual-exclusion
+        if after_ms.is_some() && before_ms.is_some() {
+            return Err(BuildError::BothCursors);
+        }
+
+        // ───────── Cursor unit (≤ 13 digits ⇒ milliseconds)
+        if let Some(nanos) = after_ms {
+            if nanos.abs() > 9_999_999_999_999 {
+                return Err(BuildError::CursorIsNanoseconds);
+            }
+        }
+
+        if let Some(nanos) = before_ms {
+            if nanos.abs() > 9_999_999_999_999 {
+                return Err(BuildError::CursorIsNanoseconds);
+            }
+        }
+
+        // ───────── Limit validation
+        // Note: Regular endpoint supports up to 300, history endpoint up to 100
+        // This validation is conservative for safety across both endpoints
+        if let Some(limit) = limit {
+            if limit > 300 {
+                return Err(BuildError::LimitTooHigh);
+            }
+        }
+
+        Ok(GetCandlesticksParams {
+            inst_id,
+            bar,
+            after_ms,
+            before_ms,
+            limit,
+        })
+    }
 }
 
 /// Parameters for the GET /api/v5/public/mark-price.

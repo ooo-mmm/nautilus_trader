@@ -100,3 +100,7 @@ path = "bin/ws-data.rs"
 [[bin]]
 name = "okx-ws-exec"
 path = "bin/ws-exec.rs"
+
+[[bin]]
+name = "okx-test-bars"
+path = "bin/test-bars.rs"
