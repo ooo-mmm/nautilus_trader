@@ -74,6 +74,7 @@ env/
 *.sh
 *tmp/
 *temp/
+.direnv/
 
 # System and editor specific
 .DS_Store
