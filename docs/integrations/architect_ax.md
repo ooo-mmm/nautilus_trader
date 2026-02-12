@@ -116,19 +116,24 @@ The sandbox environment is the default to prevent accidental live trading.
 
 ## Market data
 
-The adapter provides comprehensive real-time market data via WebSocket subscriptions.
+The adapter provides real-time market data via WebSocket subscriptions, with HTTP endpoints
+for historical data backfill.
 
 ### Data types
 
-| AX Data         | Nautilus Data Type  | Notes                                        |
-|-----------------|---------------------|----------------------------------------------|
-| Order book (L1) | `QuoteTick`         | Best bid/ask top-of-book.                    |
-| Order book (L2) | `OrderBookDelta`    | Aggregated price levels.                     |
-| Order book (L3) | `OrderBookDelta`    | Individual order quantities.                 |
-| Trades          | `TradeTick`         | Real-time trade events from L1 subscription. |
-| Tickers         | `QuoteTick`         | Mark price, index price, 24h statistics.     |
-| Bars/candles    | `Bar`               | OHLCV data with buy/sell volume.             |
-| Funding rates   | `FundingRateUpdate` | Current funding rate and settlement info.    |
+| AX Data         | Nautilus Data Type  | Notes                                                    |
+|-----------------|---------------------|----------------------------------------------------------|
+| Order book (L1) | `QuoteTick`         | Best bid/ask top-of-book from L1 book subscription.      |
+| Order book (L2) | `OrderBookDelta`    | Aggregated price levels.                                 |
+| Order book (L3) | `OrderBookDelta`    | Individual order quantities.                             |
+| Trades          | `TradeTick`         | Real-time trade events from L1 subscription.             |
+| Bars/candles    | `Bar`               | OHLCV data (total volume only, no buy/sell breakdown).   |
+| Funding rates   | `FundingRateUpdate` | Polled via HTTP every 15 minutes (not real-time WebSocket). |
+
+:::note
+Historical quote tick requests are not supported by AX Exchange. Only real-time quote
+data is available via WebSocket L1 book subscriptions.
+:::
 
 ### Bar intervals
 
@@ -179,13 +184,13 @@ AX Exchange supports market and limit order types with stop triggers.
 
 ### Advanced order features
 
-| Feature            | Supported | Notes                                     |
-|--------------------|-----------|-------------------------------------------|
-| Order modification | ✓         | Price and quantity modification.          |
-| Cancel order       | ✓         | Single order cancellation.                |
-| Cancel all orders  | ✓         | Cancel all open orders for an instrument. |
-| Batch cancel       | ✓         | Cancel multiple specified orders.         |
-| Order lists        | ✓         | Submit multiple orders in a single list.  |
+| Feature            | Supported | Notes                                                       |
+|--------------------|-----------|-------------------------------------------------------------|
+| Order modification | -         | *Not supported by AX*. Cancel and resubmit instead.         |
+| Cancel order       | ✓         | Single order cancellation.                                  |
+| Cancel all orders  | ✓         | Cancel all open orders for an instrument.                   |
+| Batch cancel       | ✓         | Cancel multiple specified orders.                           |
+| Order lists        | ✓         | Sequential submission (orders submitted individually, non-atomic). |
 
 ### Position management
 
@@ -197,17 +202,25 @@ AX Exchange supports market and limit order types with stop triggers.
 
 ### Order querying
 
-| Feature              | Supported | Notes                             |
-|----------------------|-----------|-----------------------------------|
-| Query open orders    | ✓         | List all active orders.           |
-| Order status reports | ✓         | Full order lifecycle reporting.   |
-| Fill reports         | ✓         | Execution and fill history.       |
+| Feature              | Supported | Notes                                                          |
+|----------------------|-----------|----------------------------------------------------------------|
+| Query open orders    | ✓         | List all active orders.                                        |
+| Query single order   | ✓         | By venue order ID or client order ID (any order state).        |
+| Order status reports | ✓         | Reconciliation from open orders; see note below.               |
+| Fill reports         | ✓         | Execution and fill history.                                    |
+
+:::note
+Order status reports for reconciliation are generated from the open orders endpoint.
+Filled or canceled orders are not included in the reconciliation snapshot. Single-order
+queries via `query_order` use the dedicated `/order-status` endpoint which works for
+any order state.
+:::
 
 ## Authentication
 
 AX Exchange uses bearer token authentication:
 
-1. API key and secret (with optional TOTP for 2FA) obtain a session token via `/authenticate`.
+1. API key and secret obtain a session token via `/authenticate`.
 2. The session token is used as a bearer token for subsequent REST and WebSocket requests.
 3. Session tokens expire after a configurable period (default: 86400 seconds).
 
@@ -215,10 +228,15 @@ AX Exchange uses bearer token authentication:
 
 ### Environments and endpoints
 
-| Environment | HTTP API                                         | Market Data WS                                   | Orders WS                                            |
-|-------------|--------------------------------------------------|--------------------------------------------------|------------------------------------------------------|
-| Sandbox     | `https://gateway.sandbox.architect.exchange/api` | `wss://gateway.sandbox.architect.exchange/md/ws` | `wss://gateway.sandbox.architect.exchange/orders/ws` |
-| Production  | `https://gateway.architect.exchange/api`         | `wss://gateway.architect.exchange/md/ws`         | `wss://gateway.architect.exchange/orders/ws`         |
+| Environment | HTTP API (market data)                           | HTTP API (orders)                                   | Market Data WS                                   | Orders WS                                            |
+|-------------|--------------------------------------------------|-----------------------------------------------------|--------------------------------------------------|------------------------------------------------------|
+| Sandbox     | `https://gateway.sandbox.architect.exchange/api` | `https://gateway.sandbox.architect.exchange/orders` | `wss://gateway.sandbox.architect.exchange/md/ws` | `wss://gateway.sandbox.architect.exchange/orders/ws` |
+| Production  | `https://gateway.architect.exchange/api`         | `https://gateway.architect.exchange/orders`         | `wss://gateway.architect.exchange/md/ws`         | `wss://gateway.architect.exchange/orders/ws`         |
+
+:::info
+Order management HTTP endpoints (place, cancel, order status) use a separate base URL
+from market data endpoints. This is handled automatically by the adapter configuration.
+:::
 
 ### Data client configuration options
 
@@ -242,7 +260,6 @@ AX Exchange uses bearer token authentication:
 |--------------------------|-----------|---------------------------------------------------------------------|
 | `api_key`                | `None`    | API key; loaded from `AX_API_KEY` env var when omitted.             |
 | `api_secret`             | `None`    | API secret; loaded from `AX_API_SECRET` env var when omitted.       |
-| `totp_secret`            | `None`    | TOTP secret for 2FA; loaded from `AX_TOTP_SECRET` env var when omitted. |
 | `environment`            | `SANDBOX` | Trading environment (`SANDBOX` or `PRODUCTION`).                    |
 | `base_url_http`          | `None`    | Override for the REST base URL.                                     |
 | `base_url_ws`            | `None`    | Override for the orders WebSocket URL.                              |
@@ -308,13 +325,6 @@ set the following environment variables:
 
 - `AX_API_KEY`
 - `AX_API_SECRET`
-
-For accounts with two-factor authentication (2FA) enabled, also set:
-
-- `AX_TOTP_SECRET`
-
-This is the base32 TOTP secret displayed when you set up 2FA (often shown as a QR code or text
-string).
 
 :::tip
 We recommend using environment variables to manage your credentials.

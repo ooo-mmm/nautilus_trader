@@ -15,8 +15,11 @@
 
 //! Enumerations that model Ax string enums across HTTP and WebSocket payloads.
 
-use nautilus_model::enums::{
-    AggressorSide, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
+use nautilus_model::{
+    data::BarSpecification,
+    enums::{
+        AggressorSide, BarAggregation, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
+    },
 };
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display, EnumIter, EnumString};
@@ -479,10 +482,6 @@ pub enum AxMarketDataLevel {
     Serialize,
     Deserialize,
 )]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.architect")
-)]
 pub enum AxCandleWidth {
     /// 1-second candles.
     #[serde(rename = "1s")]
@@ -512,6 +511,97 @@ pub enum AxCandleWidth {
     #[serde(rename = "1d")]
     #[strum(serialize = "1d")]
     Days1,
+}
+
+impl TryFrom<&BarSpecification> for AxCandleWidth {
+    type Error = anyhow::Error;
+
+    fn try_from(spec: &BarSpecification) -> Result<Self, Self::Error> {
+        let step = spec.step.get();
+        match (step, spec.aggregation) {
+            (1, BarAggregation::Second) => Ok(Self::Seconds1),
+            (5, BarAggregation::Second) => Ok(Self::Seconds5),
+            (1, BarAggregation::Minute) => Ok(Self::Minutes1),
+            (5, BarAggregation::Minute) => Ok(Self::Minutes5),
+            (15, BarAggregation::Minute) => Ok(Self::Minutes15),
+            (1, BarAggregation::Hour) => Ok(Self::Hours1),
+            (1, BarAggregation::Day) => Ok(Self::Days1),
+            _ => anyhow::bail!(
+                "Unsupported bar specification for AX: {step}-{:?}",
+                spec.aggregation,
+            ),
+        }
+    }
+}
+
+/// WebSocket market data request type (client to server).
+///
+/// # References
+/// - <https://docs.architect.exchange/api-reference/marketdata/md-ws>
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Display,
+    Eq,
+    PartialEq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+pub enum AxMdRequestType {
+    /// Subscribe to market data for a symbol.
+    #[serde(rename = "subscribe")]
+    #[strum(serialize = "subscribe")]
+    Subscribe,
+    /// Unsubscribe from market data for a symbol.
+    #[serde(rename = "unsubscribe")]
+    #[strum(serialize = "unsubscribe")]
+    Unsubscribe,
+    /// Subscribe to candle data for a symbol.
+    #[serde(rename = "subscribe_candles")]
+    #[strum(serialize = "subscribe_candles")]
+    SubscribeCandles,
+    /// Unsubscribe from candle data for a symbol.
+    #[serde(rename = "unsubscribe_candles")]
+    #[strum(serialize = "unsubscribe_candles")]
+    UnsubscribeCandles,
+}
+
+/// WebSocket order request type (client to server).
+///
+/// # References
+/// - <https://docs.architect.exchange/api-reference/order-management/orders-ws>
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Display,
+    Eq,
+    PartialEq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+pub enum AxOrderRequestType {
+    /// Place a new order.
+    #[serde(rename = "p")]
+    #[strum(serialize = "p")]
+    PlaceOrder,
+    /// Cancel an existing order.
+    #[serde(rename = "x")]
+    #[strum(serialize = "x")]
+    CancelOrder,
+    /// Get open orders.
+    #[serde(rename = "o")]
+    #[strum(serialize = "o")]
+    GetOpenOrders,
 }
 
 /// WebSocket market data message type (server to client).
@@ -839,5 +929,36 @@ mod tests {
 
         let parsed: AxOrderWsMessageType = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, msg_type);
+    }
+
+    #[rstest]
+    #[case(AxMdRequestType::Subscribe, "\"subscribe\"")]
+    #[case(AxMdRequestType::Unsubscribe, "\"unsubscribe\"")]
+    #[case(AxMdRequestType::SubscribeCandles, "\"subscribe_candles\"")]
+    #[case(AxMdRequestType::UnsubscribeCandles, "\"unsubscribe_candles\"")]
+    fn test_md_request_type_serialization(
+        #[case] request_type: AxMdRequestType,
+        #[case] expected: &str,
+    ) {
+        let json = serde_json::to_string(&request_type).unwrap();
+        assert_eq!(json, expected);
+
+        let parsed: AxMdRequestType = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, request_type);
+    }
+
+    #[rstest]
+    #[case(AxOrderRequestType::PlaceOrder, "\"p\"")]
+    #[case(AxOrderRequestType::CancelOrder, "\"x\"")]
+    #[case(AxOrderRequestType::GetOpenOrders, "\"o\"")]
+    fn test_order_request_type_serialization(
+        #[case] request_type: AxOrderRequestType,
+        #[case] expected: &str,
+    ) {
+        let json = serde_json::to_string(&request_type).unwrap();
+        assert_eq!(json, expected);
+
+        let parsed: AxOrderRequestType = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, request_type);
     }
 }

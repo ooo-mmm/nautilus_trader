@@ -22,11 +22,14 @@ use async_trait::async_trait;
 use futures_util::{StreamExt, pin_mut};
 use nautilus_common::{
     clients::ExecutionClient,
+    enums::LogLevel,
     live::{get_runtime, runner::get_exec_event_sender},
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-        GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
-        ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+        GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
+        GenerateOrderStatusReportsBuilder, GeneratePositionStatusReports,
+        GeneratePositionStatusReportsBuilder, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
+        SubmitOrderList,
     },
 };
 use nautilus_core::{
@@ -36,11 +39,11 @@ use nautilus_core::{
 use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{AccountType, OmsType},
+    enums::{AccountType, OmsType, OrderSide},
     events::OrderEventAny,
     identifiers::{AccountId, ClientId, ClientOrderId, Venue, VenueOrderId},
-    instruments::Instrument,
-    orders::Order,
+    instruments::{Instrument, InstrumentAny},
+    orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance},
 };
@@ -72,6 +75,20 @@ pub struct BitmexExecutionClient {
 }
 
 impl BitmexExecutionClient {
+    fn log_report_receipt(count: usize, report_type: &str, log_level: LogLevel) {
+        let plural = if count == 1 { "" } else { "s" };
+        let message = format!("Received {count} {report_type}{plural}");
+
+        match log_level {
+            LogLevel::Off => {}
+            LogLevel::Trace => log::trace!("{message}"),
+            LogLevel::Debug => log::debug!("{message}"),
+            LogLevel::Info => log::info!("{message}"),
+            LogLevel::Warning => log::warn!("{message}"),
+            LogLevel::Error => log::error!("{message}"),
+        }
+    }
+
     /// Creates a new [`BitmexExecutionClient`].
     ///
     /// # Errors
@@ -212,11 +229,27 @@ impl BitmexExecutionClient {
             return Ok(());
         }
 
-        let http = self.http_client.clone();
-        let mut instruments = http
-            .request_instruments(self.config.active_only)
-            .await
-            .context("failed to request BitMEX instruments")?;
+        let mut instruments: Vec<InstrumentAny> = {
+            let cache = self.core.cache();
+            cache
+                .instruments(&self.core.venue, None)
+                .into_iter()
+                .cloned()
+                .collect()
+        };
+
+        if instruments.is_empty() {
+            let http = self.http_client.clone();
+            instruments = http
+                .request_instruments(self.config.active_only)
+                .await
+                .context("failed to request BitMEX instruments")?;
+        } else {
+            log::debug!(
+                "Reusing {} cached BitMEX instruments for execution client initialization",
+                instruments.len()
+            );
+        }
 
         instruments.sort_by_key(|instrument| instrument.id());
 
@@ -232,15 +265,6 @@ impl BitmexExecutionClient {
         Ok(())
     }
 
-    fn ensure_instruments_initialized(&mut self) -> anyhow::Result<()> {
-        if self.core.instruments_initialized() {
-            return Ok(());
-        }
-
-        let runtime = get_runtime();
-        runtime.block_on(self.ensure_instruments_initialized_async())
-    }
-
     async fn refresh_account_state(&self) -> anyhow::Result<()> {
         let account_state = self
             .http_client
@@ -250,11 +274,6 @@ impl BitmexExecutionClient {
 
         self.emitter.send_account_state(account_state);
         Ok(())
-    }
-
-    fn update_account_state(&self) -> anyhow::Result<()> {
-        let runtime = get_runtime();
-        runtime.block_on(self.refresh_account_state())
     }
 
     fn start_ws_stream(&mut self) -> anyhow::Result<()> {
@@ -275,244 +294,13 @@ impl BitmexExecutionClient {
         self.ws_stream_handle = Some(handle);
         Ok(())
     }
-}
 
-#[async_trait(?Send)]
-impl ExecutionClient for BitmexExecutionClient {
-    fn is_connected(&self) -> bool {
-        self.core.is_connected()
-    }
-
-    fn client_id(&self) -> ClientId {
-        self.core.client_id
-    }
-
-    fn account_id(&self) -> AccountId {
-        self.core.account_id
-    }
-
-    fn venue(&self) -> Venue {
-        self.core.venue
-    }
-
-    fn oms_type(&self) -> OmsType {
-        self.core.oms_type
-    }
-
-    fn get_account(&self) -> Option<AccountAny> {
-        self.core.cache().account(&self.core.account_id).cloned()
-    }
-
-    fn generate_account_state(
+    fn submit_cached_order(
         &self,
-        balances: Vec<AccountBalance>,
-        margins: Vec<MarginBalance>,
-        reported: bool,
-        ts_event: UnixNanos,
+        order: OrderAny,
+        submit_tries: Option<usize>,
+        task_label: &'static str,
     ) -> anyhow::Result<()> {
-        self.emitter
-            .emit_account_state(balances, margins, reported, ts_event);
-        Ok(())
-    }
-
-    fn start(&mut self) -> anyhow::Result<()> {
-        if self.core.is_started() {
-            return Ok(());
-        }
-
-        self.emitter.set_sender(get_exec_event_sender());
-        self.ensure_instruments_initialized()?;
-        self.core.set_started();
-        log::info!(
-            "BitMEX execution client started: client_id={}, account_id={}, use_testnet={}, submitter_pool_size={:?}, canceller_pool_size={:?}, http_proxy_url={:?}, ws_proxy_url={:?}, submitter_proxy_urls={:?}, canceller_proxy_urls={:?}",
-            self.core.client_id,
-            self.core.account_id,
-            self.config.use_testnet,
-            self.config.submitter_pool_size,
-            self.config.canceller_pool_size,
-            self.config.http_proxy_url,
-            self.config.ws_proxy_url,
-            self.config.submitter_proxy_urls,
-            self.config.canceller_proxy_urls,
-        );
-        Ok(())
-    }
-
-    fn stop(&mut self) -> anyhow::Result<()> {
-        if self.core.is_stopped() {
-            return Ok(());
-        }
-
-        self.core.set_stopped();
-        self.core.set_disconnected();
-        if let Some(handle) = self.ws_stream_handle.take() {
-            handle.abort();
-        }
-        self.abort_pending_tasks();
-        log::info!("BitMEX execution client {} stopped", self.core.client_id);
-        Ok(())
-    }
-
-    async fn connect(&mut self) -> anyhow::Result<()> {
-        if self.core.is_connected() {
-            return Ok(());
-        }
-
-        self.ensure_instruments_initialized_async().await?;
-
-        self.ws_client.connect().await?;
-        self.ws_client.wait_until_active(10.0).await?;
-
-        // Start submitter/canceller after WS connection succeeds
-        self._submitter.start().await?;
-        self._canceller.start().await?;
-
-        self.ws_client.subscribe_orders().await?;
-        self.ws_client.subscribe_executions().await?;
-        self.ws_client.subscribe_positions().await?;
-        self.ws_client.subscribe_wallet().await?;
-        if let Err(e) = self.ws_client.subscribe_margin().await {
-            log::debug!("Margin subscription unavailable: {e:?}");
-        }
-
-        self.start_ws_stream()?;
-        self.refresh_account_state().await?;
-
-        self.core.set_connected();
-        log::info!("Connected: client_id={}", self.core.client_id);
-        Ok(())
-    }
-
-    async fn disconnect(&mut self) -> anyhow::Result<()> {
-        if self.core.is_disconnected() {
-            return Ok(());
-        }
-
-        self.http_client.cancel_all_requests();
-        self._submitter.stop().await;
-        self._canceller.stop().await;
-
-        if let Err(e) = self.ws_client.close().await {
-            log::warn!("Error while closing BitMEX execution websocket: {e:?}");
-        }
-
-        if let Some(handle) = self.ws_stream_handle.take() {
-            handle.abort();
-        }
-
-        self.abort_pending_tasks();
-        self.core.set_disconnected();
-        log::info!("Disconnected: client_id={}", self.core.client_id);
-        Ok(())
-    }
-
-    async fn generate_order_status_report(
-        &self,
-        cmd: &GenerateOrderStatusReport,
-    ) -> anyhow::Result<Option<OrderStatusReport>> {
-        let instrument_id = cmd
-            .instrument_id
-            .context("BitMEX generate_order_status_report requires an instrument identifier")?;
-
-        self.http_client
-            .query_order(
-                instrument_id,
-                cmd.client_order_id,
-                cmd.venue_order_id.map(|id| VenueOrderId::from(id.as_str())),
-            )
-            .await
-            .context("failed to query BitMEX order status")
-    }
-
-    async fn generate_order_status_reports(
-        &self,
-        cmd: &GenerateOrderStatusReports,
-    ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        let reports = self
-            .http_client
-            .request_order_status_reports(cmd.instrument_id, cmd.open_only, None)
-            .await
-            .context("failed to request BitMEX order status reports")?;
-        Ok(reports)
-    }
-
-    async fn generate_fill_reports(
-        &self,
-        cmd: GenerateFillReports,
-    ) -> anyhow::Result<Vec<FillReport>> {
-        let mut reports = self
-            .http_client
-            .request_fill_reports(cmd.instrument_id, None)
-            .await
-            .context("failed to request BitMEX fill reports")?;
-
-        if let Some(order_id) = cmd.venue_order_id {
-            reports.retain(|report| report.venue_order_id.as_str() == order_id.as_str());
-        }
-
-        Ok(reports)
-    }
-
-    async fn generate_position_status_reports(
-        &self,
-        cmd: &GeneratePositionStatusReports,
-    ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        let mut reports = self
-            .http_client
-            .request_position_status_reports()
-            .await
-            .context("failed to request BitMEX position reports")?;
-
-        if let Some(instrument_id) = cmd.instrument_id {
-            reports.retain(|report| report.instrument_id == instrument_id);
-        }
-
-        Ok(reports)
-    }
-
-    async fn generate_mass_status(
-        &self,
-        _lookback_mins: Option<u64>,
-    ) -> anyhow::Result<Option<ExecutionMassStatus>> {
-        log::warn!("generate_mass_status not yet implemented for BitMEX execution client");
-        Ok(None)
-    }
-
-    fn query_account(&self, _cmd: &QueryAccount) -> anyhow::Result<()> {
-        self.update_account_state()
-    }
-
-    fn query_order(&self, cmd: &QueryOrder) -> anyhow::Result<()> {
-        let http_client = self.http_client.clone();
-        let instrument_id = cmd.instrument_id;
-        let client_order_id = Some(cmd.client_order_id);
-        let venue_order_id = cmd.venue_order_id;
-        let emitter = self.emitter.clone();
-
-        self.spawn_task("query_order", async move {
-            match http_client
-                .request_order_status_report(instrument_id, client_order_id, venue_order_id)
-                .await
-            {
-                Ok(report) => emitter.send_order_status_report(report),
-                Err(e) => log::error!("BitMEX query order failed: {e:?}"),
-            }
-            Ok(())
-        });
-
-        Ok(())
-    }
-
-    fn submit_order(&self, cmd: &SubmitOrder) -> anyhow::Result<()> {
-        let order = self
-            .core
-            .cache()
-            .order(&cmd.client_order_id)
-            .cloned()
-            .ok_or_else(|| {
-                anyhow::anyhow!("Order not found in cache for {}", cmd.client_order_id)
-            })?;
-
         if order.is_closed() {
             log::warn!("Cannot submit closed order {}", order.client_order_id());
             return Ok(());
@@ -520,15 +308,7 @@ impl ExecutionClient for BitmexExecutionClient {
 
         self.emitter.emit_order_submitted(&order);
 
-        let submit_tries = cmd
-            .params
-            .as_ref()
-            .and_then(|params| params.get("submit_tries"))
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0);
-
         let use_broadcaster = submit_tries.is_some_and(|n| n > 1);
-
         let http_client = self.http_client.clone();
         let submitter = self._submitter.clone_for_async();
         let emitter = self.emitter.clone();
@@ -551,7 +331,7 @@ impl ExecutionClient for BitmexExecutionClient {
         let order_list_id = order.order_list_id();
         let contingency_type = order.contingency_type();
 
-        self.spawn_task("submit_order", async move {
+        self.spawn_task(task_label, async move {
             let result = if use_broadcaster {
                 submitter
                     .broadcast_submit(
@@ -628,12 +408,373 @@ impl ExecutionClient for BitmexExecutionClient {
 
         Ok(())
     }
+}
+
+#[async_trait(?Send)]
+impl ExecutionClient for BitmexExecutionClient {
+    fn is_connected(&self) -> bool {
+        self.core.is_connected()
+    }
+
+    fn client_id(&self) -> ClientId {
+        self.core.client_id
+    }
+
+    fn account_id(&self) -> AccountId {
+        self.core.account_id
+    }
+
+    fn venue(&self) -> Venue {
+        self.core.venue
+    }
+
+    fn oms_type(&self) -> OmsType {
+        self.core.oms_type
+    }
+
+    fn get_account(&self) -> Option<AccountAny> {
+        self.core.cache().account(&self.core.account_id).cloned()
+    }
+
+    fn generate_account_state(
+        &self,
+        balances: Vec<AccountBalance>,
+        margins: Vec<MarginBalance>,
+        reported: bool,
+        ts_event: UnixNanos,
+    ) -> anyhow::Result<()> {
+        self.emitter
+            .emit_account_state(balances, margins, reported, ts_event);
+        Ok(())
+    }
+
+    fn start(&mut self) -> anyhow::Result<()> {
+        if self.core.is_started() {
+            return Ok(());
+        }
+
+        self.emitter.set_sender(get_exec_event_sender());
+        self.core.set_started();
+        log::info!(
+            "BitMEX execution client started: client_id={}, account_id={}, use_testnet={}, submitter_pool_size={:?}, canceller_pool_size={:?}, http_proxy_url={:?}, ws_proxy_url={:?}, submitter_proxy_urls={:?}, canceller_proxy_urls={:?}",
+            self.core.client_id,
+            self.core.account_id,
+            self.config.use_testnet,
+            self.config.submitter_pool_size,
+            self.config.canceller_pool_size,
+            self.config.http_proxy_url,
+            self.config.ws_proxy_url,
+            self.config.submitter_proxy_urls,
+            self.config.canceller_proxy_urls,
+        );
+        Ok(())
+    }
+
+    fn stop(&mut self) -> anyhow::Result<()> {
+        if self.core.is_stopped() {
+            return Ok(());
+        }
+
+        self.core.set_stopped();
+        self.core.set_disconnected();
+        if let Some(handle) = self.ws_stream_handle.take() {
+            handle.abort();
+        }
+        self.abort_pending_tasks();
+        log::info!("BitMEX execution client {} stopped", self.core.client_id);
+        Ok(())
+    }
+
+    async fn connect(&mut self) -> anyhow::Result<()> {
+        if self.core.is_connected() {
+            return Ok(());
+        }
+
+        // Reset cancellation token so HTTP requests succeed after reconnect
+        self.http_client.reset_cancellation_token();
+
+        self.ensure_instruments_initialized_async().await?;
+
+        self.ws_client.connect().await?;
+        self.ws_client.wait_until_active(10.0).await?;
+
+        // Start submitter/canceller after WS connection succeeds
+        self._submitter.start().await?;
+        self._canceller.start().await?;
+
+        self.ws_client.subscribe_orders().await?;
+        self.ws_client.subscribe_executions().await?;
+        self.ws_client.subscribe_positions().await?;
+        self.ws_client.subscribe_wallet().await?;
+        if let Err(e) = self.ws_client.subscribe_margin().await {
+            log::debug!("Margin subscription unavailable: {e:?}");
+        }
+
+        self.start_ws_stream()?;
+        self.refresh_account_state().await?;
+
+        self.core.set_connected();
+        log::info!("Connected: client_id={}", self.core.client_id);
+        Ok(())
+    }
+
+    async fn disconnect(&mut self) -> anyhow::Result<()> {
+        if self.core.is_disconnected() {
+            return Ok(());
+        }
+
+        self.http_client.cancel_all_requests();
+        self._submitter.stop().await;
+        self._canceller.stop().await;
+
+        if let Err(e) = self.ws_client.close().await {
+            log::warn!("Error while closing BitMEX execution websocket: {e:?}");
+        }
+
+        if let Some(handle) = self.ws_stream_handle.take() {
+            handle.abort();
+        }
+
+        self.abort_pending_tasks();
+        self.core.set_disconnected();
+        log::info!("Disconnected: client_id={}", self.core.client_id);
+        Ok(())
+    }
+
+    async fn generate_order_status_report(
+        &self,
+        cmd: &GenerateOrderStatusReport,
+    ) -> anyhow::Result<Option<OrderStatusReport>> {
+        let instrument_id = cmd
+            .instrument_id
+            .context("BitMEX generate_order_status_report requires an instrument identifier")?;
+
+        self.http_client
+            .query_order(
+                instrument_id,
+                cmd.client_order_id,
+                cmd.venue_order_id.map(|id| VenueOrderId::from(id.as_str())),
+            )
+            .await
+            .context("failed to query BitMEX order status")
+    }
+
+    async fn generate_order_status_reports(
+        &self,
+        cmd: &GenerateOrderStatusReports,
+    ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        let start_dt = cmd.start.map(|nanos| nanos.to_datetime_utc());
+        let end_dt = cmd.end.map(|nanos| nanos.to_datetime_utc());
+
+        let mut reports = self
+            .http_client
+            .request_order_status_reports(cmd.instrument_id, cmd.open_only, start_dt, end_dt, None)
+            .await
+            .context("failed to request BitMEX order status reports")?;
+
+        if let Some(start) = cmd.start {
+            reports.retain(|report| report.ts_last >= start);
+        }
+
+        if let Some(end) = cmd.end {
+            reports.retain(|report| report.ts_last <= end);
+        }
+
+        Self::log_report_receipt(reports.len(), "OrderStatusReport", cmd.log_receipt_level);
+
+        Ok(reports)
+    }
+
+    async fn generate_fill_reports(
+        &self,
+        cmd: GenerateFillReports,
+    ) -> anyhow::Result<Vec<FillReport>> {
+        let start_dt = cmd.start.map(|nanos| nanos.to_datetime_utc());
+        let end_dt = cmd.end.map(|nanos| nanos.to_datetime_utc());
+
+        let mut reports = self
+            .http_client
+            .request_fill_reports(cmd.instrument_id, start_dt, end_dt, None)
+            .await
+            .context("failed to request BitMEX fill reports")?;
+
+        if let Some(order_id) = cmd.venue_order_id {
+            reports.retain(|report| report.venue_order_id.as_str() == order_id.as_str());
+        }
+
+        if let Some(start) = cmd.start {
+            reports.retain(|report| report.ts_event >= start);
+        }
+
+        if let Some(end) = cmd.end {
+            reports.retain(|report| report.ts_event <= end);
+        }
+
+        Self::log_report_receipt(reports.len(), "FillReport", cmd.log_receipt_level);
+
+        Ok(reports)
+    }
+
+    async fn generate_position_status_reports(
+        &self,
+        cmd: &GeneratePositionStatusReports,
+    ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        let mut reports = self
+            .http_client
+            .request_position_status_reports()
+            .await
+            .context("failed to request BitMEX position reports")?;
+
+        if let Some(instrument_id) = cmd.instrument_id {
+            reports.retain(|report| report.instrument_id == instrument_id);
+        }
+
+        if let Some(start) = cmd.start {
+            reports.retain(|report| report.ts_last >= start);
+        }
+
+        if let Some(end) = cmd.end {
+            reports.retain(|report| report.ts_last <= end);
+        }
+
+        Self::log_report_receipt(reports.len(), "PositionStatusReport", cmd.log_receipt_level);
+
+        Ok(reports)
+    }
+
+    async fn generate_mass_status(
+        &self,
+        lookback_mins: Option<u64>,
+    ) -> anyhow::Result<Option<ExecutionMassStatus>> {
+        log::info!("Generating ExecutionMassStatus (lookback_mins={lookback_mins:?})");
+
+        let ts_now = self.clock.get_time_ns();
+        let start = lookback_mins.map(|mins| {
+            let lookback_ns = mins.saturating_mul(60).saturating_mul(1_000_000_000);
+            UnixNanos::from(ts_now.as_u64().saturating_sub(lookback_ns))
+        });
+
+        let order_cmd = GenerateOrderStatusReportsBuilder::default()
+            .ts_init(ts_now)
+            .open_only(false)
+            .start(start)
+            .build()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let fill_cmd = GenerateFillReportsBuilder::default()
+            .ts_init(ts_now)
+            .start(start)
+            .build()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let position_cmd = GeneratePositionStatusReportsBuilder::default()
+            .ts_init(ts_now)
+            .start(start)
+            .build()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let (order_reports, fill_reports, position_reports) = tokio::try_join!(
+            self.generate_order_status_reports(&order_cmd),
+            self.generate_fill_reports(fill_cmd),
+            self.generate_position_status_reports(&position_cmd),
+        )?;
+
+        let mut mass_status = ExecutionMassStatus::new(
+            self.core.client_id,
+            self.core.account_id,
+            self.core.venue,
+            ts_now,
+            None,
+        );
+        mass_status.add_order_reports(order_reports);
+        mass_status.add_fill_reports(fill_reports);
+        mass_status.add_position_reports(position_reports);
+
+        Ok(Some(mass_status))
+    }
+
+    fn query_account(&self, _cmd: &QueryAccount) -> anyhow::Result<()> {
+        let http_client = self.http_client.clone();
+        let emitter = self.emitter.clone();
+        let account_id = self.core.account_id;
+
+        self.spawn_task("query_account", async move {
+            match http_client.request_account_state(account_id).await {
+                Ok(account_state) => emitter.send_account_state(account_state),
+                Err(e) => log::error!("BitMEX query account failed: {e:?}"),
+            }
+            Ok(())
+        });
+
+        Ok(())
+    }
+
+    fn query_order(&self, cmd: &QueryOrder) -> anyhow::Result<()> {
+        let http_client = self.http_client.clone();
+        let instrument_id = cmd.instrument_id;
+        let client_order_id = Some(cmd.client_order_id);
+        let venue_order_id = cmd.venue_order_id;
+        let emitter = self.emitter.clone();
+
+        self.spawn_task("query_order", async move {
+            match http_client
+                .request_order_status_report(instrument_id, client_order_id, venue_order_id)
+                .await
+            {
+                Ok(report) => emitter.send_order_status_report(report),
+                Err(e) => log::error!("BitMEX query order failed: {e:?}"),
+            }
+            Ok(())
+        });
+
+        Ok(())
+    }
+
+    fn submit_order(&self, cmd: &SubmitOrder) -> anyhow::Result<()> {
+        let submit_tries = cmd
+            .params
+            .as_ref()
+            .and_then(|params| params.get("submit_tries"))
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0);
+
+        let order = self
+            .core
+            .cache()
+            .order(&cmd.client_order_id)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!("Order not found in cache for {}", cmd.client_order_id)
+            })?;
+
+        self.submit_cached_order(order, submit_tries, "submit_order")
+    }
 
     fn submit_order_list(&self, cmd: &SubmitOrderList) -> anyhow::Result<()> {
-        log::warn!(
-            "submit_order_list not yet implemented for BitMEX execution client ({} orders)",
-            cmd.order_list.client_order_ids.len()
+        if cmd.order_list.client_order_ids.is_empty() {
+            log::debug!("submit_order_list called with empty order list");
+            return Ok(());
+        }
+
+        let submit_tries = cmd
+            .params
+            .as_ref()
+            .and_then(|params| params.get("submit_tries"))
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0);
+
+        let orders = self.core.get_orders_for_list(&cmd.order_list)?;
+
+        log::info!(
+            "Submitting BitMEX order list: order_list_id={}, count={}",
+            cmd.order_list.id,
+            orders.len(),
         );
+
+        for order in orders {
+            self.submit_cached_order(order, submit_tries, "submit_order_list_item")?;
+        }
+
         Ok(())
     }
 
@@ -697,7 +838,14 @@ impl ExecutionClient for BitmexExecutionClient {
         let canceller = self._canceller.clone_for_async();
         let emitter = self.emitter.clone();
         let instrument_id = cmd.instrument_id;
-        let order_side = Some(cmd.order_side);
+        let order_side = if cmd.order_side == OrderSide::NoOrderSide {
+            log::debug!(
+                "BitMEX cancel_all_orders received NoOrderSide for {instrument_id}, using unfiltered cancel-all",
+            );
+            None
+        } else {
+            Some(cmd.order_side)
+        };
 
         self.spawn_task("cancel_all_orders", async move {
             match canceller
@@ -790,6 +938,11 @@ fn dispatch_ws_message(message: NautilusWsMessage, emitter: &ExecutionEventEmitt
         }
         NautilusWsMessage::OrderUpdated(event) => {
             emitter.send_order_event(OrderEventAny::Updated(*event));
+        }
+        NautilusWsMessage::OrderUpdates(events) => {
+            for event in events {
+                emitter.send_order_event(OrderEventAny::Updated(event));
+            }
         }
         NautilusWsMessage::Data(_)
         | NautilusWsMessage::Instruments(_)

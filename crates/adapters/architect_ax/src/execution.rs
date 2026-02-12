@@ -40,7 +40,7 @@ use nautilus_core::{
 use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{AccountType, OmsType, OrderType},
+    enums::{AccountType, OmsType, OrderSide, OrderType, TimeInForce},
     events::OrderEventAny,
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
@@ -50,7 +50,6 @@ use nautilus_model::{
     types::{AccountBalance, MarginBalance, Price},
 };
 use tokio::task::JoinHandle;
-use totp_rs::{Algorithm, Secret, TOTP};
 
 use crate::{
     common::{consts::AX_VENUE, enums::AxOrderSide, parse::quantity_to_contracts},
@@ -130,43 +129,10 @@ impl AxExecutionClient {
             .or_else(|| std::env::var("AX_API_SECRET").ok())
             .context("AX_API_SECRET not configured")?;
 
-        match self
-            .http_client
+        self.http_client
             .authenticate(&api_key, &api_secret, 3600)
             .await
-        {
-            Ok(token) => Ok(token),
-            Err(e) => {
-                let totp_secret = self
-                    .config
-                    .totp_secret
-                    .clone()
-                    .or_else(|| std::env::var("AX_TOTP_SECRET").ok());
-
-                if let Some(secret) = totp_secret {
-                    log::info!("2FA required, generating TOTP code...");
-                    let code = self.generate_totp(&secret)?;
-                    self.http_client
-                        .authenticate_with_totp(&api_key, &api_secret, 3600, Some(&code))
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Authentication with 2FA failed: {e}"))
-                } else {
-                    Err(anyhow::anyhow!("Authentication failed: {e}"))
-                }
-            }
-        }
-    }
-
-    fn generate_totp(&self, secret: &str) -> anyhow::Result<String> {
-        let secret_bytes = Secret::Encoded(secret.to_string())
-            .to_bytes()
-            .map_err(|e| anyhow::anyhow!("Invalid TOTP secret: {e}"))?;
-
-        let totp = TOTP::new(Algorithm::SHA1, 6, 1, 30, secret_bytes)
-            .map_err(|e| anyhow::anyhow!("Invalid TOTP configuration: {e}"))?;
-
-        totp.generate_current()
-            .map_err(|e| anyhow::anyhow!("Failed to generate TOTP: {e}"))
+            .map_err(|e| anyhow::anyhow!("Authentication failed: {e}"))
     }
 
     async fn refresh_account_state(&self) -> anyhow::Result<()> {
@@ -434,6 +400,9 @@ impl ExecutionClient for AxExecutionClient {
             return Ok(());
         }
 
+        // Reset so requests work after a previous disconnect
+        self.http_client.reset_cancellation_token();
+
         if !self.core.instruments_initialized() {
             let instruments = self
                 .http_client
@@ -516,10 +485,45 @@ impl ExecutionClient for AxExecutionClient {
     }
 
     fn query_order(&self, cmd: &QueryOrder) -> anyhow::Result<()> {
-        log::debug!(
-            "query_order not implemented for AX execution client (client_order_id={})",
-            cmd.client_order_id
-        );
+        let http_client = self.http_client.clone();
+        let account_id = self.core.account_id;
+        let client_order_id = cmd.client_order_id;
+        let venue_order_id = cmd.venue_order_id;
+        let instrument_id = cmd.instrument_id;
+        let emitter = self.emitter.clone();
+
+        // Read immutable order fields from cache before spawning
+        let (order_side, order_type, time_in_force) = {
+            let cache = self.core.cache();
+            match cache.order(&client_order_id) {
+                Some(order) => (
+                    order.order_side(),
+                    order.order_type(),
+                    order.time_in_force(),
+                ),
+                None => (OrderSide::NoOrderSide, OrderType::Limit, TimeInForce::Gtc),
+            }
+        };
+
+        self.spawn_task("query_order", async move {
+            match http_client
+                .request_order_status(
+                    account_id,
+                    instrument_id,
+                    Some(client_order_id),
+                    venue_order_id,
+                    order_side,
+                    order_type,
+                    time_in_force,
+                )
+                .await
+            {
+                Ok(report) => emitter.send_order_status_report(report),
+                Err(e) => log::error!("AX query order failed: {e}"),
+            }
+            Ok(())
+        });
+
         Ok(())
     }
 
@@ -601,17 +605,42 @@ impl ExecutionClient for AxExecutionClient {
     }
 
     fn submit_order_list(&self, cmd: &SubmitOrderList) -> anyhow::Result<()> {
-        log::warn!(
-            "submit_order_list not yet implemented for AX execution client (got {} orders)",
-            cmd.order_list.client_order_ids.len()
-        );
+        for (client_order_id, order_init) in cmd
+            .order_list
+            .client_order_ids
+            .iter()
+            .zip(cmd.order_inits.iter())
+        {
+            let submit_cmd = SubmitOrder::new(
+                cmd.trader_id,
+                cmd.client_id,
+                cmd.strategy_id,
+                cmd.instrument_id,
+                *client_order_id,
+                order_init.clone(),
+                cmd.exec_algorithm_id,
+                cmd.position_id,
+                cmd.params.clone(),
+                UUID4::new(),
+                cmd.ts_init,
+            );
+            self.submit_order(&submit_cmd)?;
+        }
         Ok(())
     }
 
     fn modify_order(&self, cmd: &ModifyOrder) -> anyhow::Result<()> {
-        log::warn!(
-            "modify_order not yet implemented for AX execution client (client_order_id={})",
-            cmd.client_order_id
+        let reason = "AX does not support order modification. Use cancel and resubmit instead.";
+        log::error!("{reason}");
+
+        let ts_event = self.clock.get_time_ns();
+        self.emitter.emit_order_modify_rejected_event(
+            cmd.strategy_id,
+            cmd.instrument_id,
+            cmd.client_order_id,
+            cmd.venue_order_id,
+            reason,
+            ts_event,
         );
         Ok(())
     }

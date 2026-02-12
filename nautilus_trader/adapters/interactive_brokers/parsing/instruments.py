@@ -234,7 +234,7 @@ VENUES_FUT = [
 ]
 VENUES_CASH = ["IDEALPRO"]
 VENUES_CRYPTO = ["PAXOS"]
-VENUES_OPT = ["SMART"]
+VENUES_OPT = ["SMART", "EUREX"]
 VENUES_CFD = ["IBCFD"]  # self named, in fact mapping to "SMART" when parsing
 VENUES_CMDTY = ["IBCMDTY"]  # self named, in fact mapping to "SMART" when parsing
 
@@ -243,6 +243,9 @@ RE_CFD_CASH = re.compile(r"^(?P<symbol>[A-Z]{3})\.(?P<currency>[A-Z]{3})$")  # "
 RE_OPT = re.compile(
     r"^(?P<symbol>[A-Z.]{1,6}) *(?P<expiry>\d{6})(?P<right>[CP])(?P<strike>\d{5})(?P<decimal>\d{3})$",
 )  # "AAPL220617C00155000" or "SPXW  260120P06835000" (OCC format with padding)
+RE_OPT2 = re.compile(
+    r"^(?P<right>[CP])\s+(?P<tradingClass>[A-Z0-9]{3,6})\s+(?P<expiry>\d{8})\s+(?P<strike>\d+(?:\.\d+)?)(?:\s+(?P<style>[A-Z]))?$",
+)  # "C OESX 20260213 4775" or "P OEXP 20260212 6480 W"
 RE_FUT_UNDERLYING = re.compile(r"^(?P<symbol>\w{1,3})$")  # "ES"
 RE_FUT = re.compile(r"^(?P<symbol>\w{1,3})(?P<month>[FGHJKMNQUVXZ])(?P<year>\d{2})$")  # "ESM23"
 RE_FUT_ORIGINAL = re.compile(
@@ -1058,8 +1061,10 @@ def ib_contract_to_instrument_id_simplified_symbology(  # noqa: C901 (too comple
         symbol = (contract.localSymbol or contract.symbol).replace(" ", "-")
     elif security_type == "IND":
         symbol = f"^{(contract.localSymbol or contract.symbol)}"
-    elif security_type == "OPT":
+    elif security_type == "OPT" and contract.localSymbol:
         symbol = contract.localSymbol
+    elif security_type == "OPT":
+        symbol = f"{contract.right} {contract.tradingClass} {contract.lastTradeDateOrContractMonth} {contract.strike}"
     elif security_type == "CONTFUT":
         symbol = contract.symbol
     elif security_type == "FUT" and (m := RE_FUT_ORIGINAL.match(contract.localSymbol)):
@@ -1206,18 +1211,29 @@ def instrument_id_to_ib_contract_simplified_symbology(  # noqa: C901 (too comple
             exchange=exchange,
             localSymbol=f"{m['symbol']}.{m['currency']}",
         )
-    elif exchange in VENUES_OPT and (m := RE_OPT.match(instrument_id.symbol.value)):
-        return IBContract(
-            secType="OPT",
-            exchange=exchange,
-            localSymbol=f"{m['symbol'].ljust(6)}{m['expiry']}{m['right']}{m['strike']}{m['decimal']}",
-        )
     elif str(instrument_id.symbol).startswith("^"):
         return IBContract(
             secType="IND",
             exchange=exchange,
             localSymbol=instrument_id.symbol.value[1:],
         )
+    elif exchange in VENUES_OPT:
+        if m := RE_OPT.match(instrument_id.symbol.value):
+            return IBContract(
+                secType="OPT",
+                exchange=exchange,
+                localSymbol=f"{m['symbol'].ljust(6)}{m['expiry']}{m['right']}{m['strike']}{m['decimal']}",
+            )
+        elif m := RE_OPT2.match(instrument_id.symbol.value):
+            return IBContract(
+                secType="OPT",
+                exchange=exchange,
+                symbol=m["tradingClass"],
+                tradingClass=m["tradingClass"],
+                right=m["right"],
+                strike=m["strike"],
+                lastTradeDateOrContractMonth=m["expiry"],
+            )
     elif exchange in VENUES_FUT:
         if m := RE_FUT_ORIGINAL.match(instrument_id.symbol.value):
             return IBContract(

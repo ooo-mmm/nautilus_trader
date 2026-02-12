@@ -26,7 +26,7 @@ use std::{
     collections::HashMap,
     num::NonZeroU32,
     sync::{
-        Arc, LazyLock,
+        Arc, LazyLock, RwLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -143,7 +143,7 @@ pub struct BitmexRawHttpClient {
     credential: Option<Credential>,
     recv_window_ms: u64,
     retry_manager: RetryManager<BitmexHttpError>,
-    cancellation_token: CancellationToken,
+    cancellation_token: Arc<RwLock<CancellationToken>>,
 }
 
 impl Default for BitmexRawHttpClient {
@@ -209,7 +209,7 @@ impl BitmexRawHttpClient {
             credential: None,
             recv_window_ms: recv_window_ms.unwrap_or(10_000),
             retry_manager,
-            cancellation_token: CancellationToken::new(),
+            cancellation_token: Arc::new(RwLock::new(CancellationToken::new())),
         })
     }
 
@@ -267,7 +267,7 @@ impl BitmexRawHttpClient {
             credential: Some(Credential::new(api_key, api_secret)),
             recv_window_ms: recv_window_ms.unwrap_or(10_000),
             retry_manager,
-            cancellation_token: CancellationToken::new(),
+            cancellation_token: Arc::new(RwLock::new(CancellationToken::new())),
         })
     }
 
@@ -306,13 +306,39 @@ impl BitmexRawHttpClient {
     }
 
     /// Cancel all pending HTTP requests.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cancellation token lock is poisoned.
     pub fn cancel_all_requests(&self) {
-        self.cancellation_token.cancel();
+        self.cancellation_token
+            .read()
+            .expect("cancellation token lock poisoned")
+            .cancel();
     }
 
-    /// Get the cancellation token for this client.
-    pub fn cancellation_token(&self) -> &CancellationToken {
-        &self.cancellation_token
+    /// Replace the cancellation token so new requests can proceed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cancellation token lock is poisoned.
+    pub fn reset_cancellation_token(&self) {
+        *self
+            .cancellation_token
+            .write()
+            .expect("cancellation token lock poisoned") = CancellationToken::new();
+    }
+
+    /// Get a clone of the cancellation token for this client.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cancellation token lock is poisoned.
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation_token
+            .read()
+            .expect("cancellation token lock poisoned")
+            .clone()
     }
 
     fn sign_request(
@@ -464,13 +490,15 @@ impl BitmexRawHttpClient {
             }
         };
 
+        let cancel_token = self.cancellation_token();
+
         self.retry_manager
             .execute_with_retry_with_cancel(
                 endpoint.as_str(),
                 operation,
                 should_retry,
                 create_error,
-                &self.cancellation_token,
+                &cancel_token,
             )
             .await
     }
@@ -855,7 +883,12 @@ impl BitmexHttpClient {
                 max_requests_per_minute,
                 proxy_url,
             )?,
-            _ => BitmexRawHttpClient::new(
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(BitmexHttpError::ValidationError(
+                    "Both api_key and api_secret must be provided, or neither".to_string(),
+                ));
+            }
+            (None, None) => BitmexRawHttpClient::new(
                 Some(url),
                 timeout_secs,
                 max_retries,
@@ -1163,9 +1196,14 @@ impl BitmexHttpClient {
         self.inner.cancel_all_requests();
     }
 
-    /// Get the cancellation token for this client.
+    /// Replace the cancellation token so new requests can proceed.
+    pub fn reset_cancellation_token(&self) {
+        self.inner.reset_cancellation_token();
+    }
+
+    /// Get a clone of the cancellation token for this client.
     pub fn cancellation_token(&self) -> CancellationToken {
-        self.inner.cancellation_token().clone()
+        self.inner.cancellation_token()
     }
 
     /// Caches a single instrument.
@@ -1749,12 +1787,13 @@ impl BitmexHttpClient {
 
         if let Some(side) = order_side {
             if side == OrderSide::NoOrderSide {
-                anyhow::bail!("Cannot filter by NoOrderSide");
+                log::debug!("Ignoring NoOrderSide filter for cancel_all_orders on {instrument_id}",);
+            } else {
+                let side = BitmexSide::from(side.as_specified());
+                params.filter(serde_json::json!({
+                    "side": side
+                }));
             }
-            let side = BitmexSide::from(side.as_specified());
-            params.filter(serde_json::json!({
-                "side": side
-            }));
         }
 
         let params = params.build().map_err(|e| anyhow::anyhow!(e))?;
@@ -1909,6 +1948,10 @@ impl BitmexHttpClient {
         client_order_id: Option<ClientOrderId>,
         venue_order_id: Option<VenueOrderId>,
     ) -> anyhow::Result<OrderStatusReport> {
+        if venue_order_id.is_none() && client_order_id.is_none() {
+            anyhow::bail!("Either venue_order_id or client_order_id must be provided");
+        }
+
         let mut params = GetOrderParamsBuilder::default();
         params.symbol(instrument_id.symbol.as_str());
 
@@ -1950,8 +1993,17 @@ impl BitmexHttpClient {
         &self,
         instrument_id: Option<InstrumentId>,
         open_only: bool,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
         limit: Option<u32>,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        if let (Some(start), Some(end)) = (start, end) {
+            anyhow::ensure!(
+                start < end,
+                "Invalid time range: start={start:?} end={end:?}",
+            );
+        }
+
         let mut params = GetOrderParamsBuilder::default();
 
         if let Some(instrument_id) = &instrument_id {
@@ -1962,6 +2014,14 @@ impl BitmexHttpClient {
             params.filter(serde_json::json!({
                 "open": true
             }));
+        }
+
+        if let Some(start) = start {
+            params.start_time(start);
+        }
+
+        if let Some(end) = end {
+            params.end_time(end);
         }
 
         if let Some(limit) = limit {
@@ -1981,6 +2041,28 @@ impl BitmexHttpClient {
         let mut reports = Vec::new();
 
         for order in response {
+            if let Some(start) = start {
+                match order.timestamp {
+                    Some(timestamp) if timestamp < start => continue,
+                    Some(_) => {}
+                    None => {
+                        log::debug!("Skipping order report without timestamp for bounded query");
+                        continue;
+                    }
+                }
+            }
+
+            if let Some(end) = end {
+                match order.timestamp {
+                    Some(timestamp) if timestamp > end => continue,
+                    Some(_) => {}
+                    None => {
+                        log::debug!("Skipping order report without timestamp for bounded query");
+                        continue;
+                    }
+                }
+            }
+
             // Skip orders without symbol (can happen with query responses)
             let Some(symbol) = order.symbol else {
                 log::warn!("Order response missing symbol, skipping");
@@ -2194,11 +2276,26 @@ impl BitmexHttpClient {
     pub async fn request_fill_reports(
         &self,
         instrument_id: Option<InstrumentId>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
         limit: Option<u32>,
     ) -> anyhow::Result<Vec<FillReport>> {
+        if let (Some(start), Some(end)) = (start, end) {
+            anyhow::ensure!(
+                start < end,
+                "Invalid time range: start={start:?} end={end:?}",
+            );
+        }
+
         let mut params = GetExecutionParamsBuilder::default();
         if let Some(instrument_id) = instrument_id {
             params.symbol(instrument_id.symbol.as_str());
+        }
+        if let Some(start) = start {
+            params.start_time(start);
+        }
+        if let Some(end) = end {
+            params.end_time(end);
         }
         if let Some(limit) = limit {
             params.count(limit as i32);
@@ -2216,6 +2313,28 @@ impl BitmexHttpClient {
         let mut reports = Vec::new();
 
         for exec in response {
+            if let Some(start) = start {
+                match exec.transact_time {
+                    Some(timestamp) if timestamp < start => continue,
+                    Some(_) => {}
+                    None => {
+                        log::debug!("Skipping fill report without transact_time for bounded query");
+                        continue;
+                    }
+                }
+            }
+
+            if let Some(end) = end {
+                match exec.transact_time {
+                    Some(timestamp) if timestamp > end => continue,
+                    Some(_) => {}
+                    None => {
+                        log::debug!("Skipping fill report without transact_time for bounded query");
+                        continue;
+                    }
+                }
+            }
+
             // Skip executions without symbol (e.g., CancelReject)
             let Some(symbol) = exec.symbol else {
                 log::debug!("Skipping execution without symbol: {:?}", exec.exec_type);

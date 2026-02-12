@@ -5735,10 +5735,33 @@ class AxHttpClient:
         maker_fee: Decimal | None = None,
         taker_fee: Decimal | None = None,
     ) -> list[Any]: ...
+    async def request_trade_ticks(
+        self,
+        instrument_id: InstrumentId,
+        limit: int | None = None,
+        start: dt.datetime | None = None,
+        end: dt.datetime | None = None,
+    ) -> list[TradeTick]: ...
+    async def request_bars(
+        self,
+        bar_type: BarType,
+        start: dt.datetime | None = None,
+        end: dt.datetime | None = None,
+    ) -> list[Bar]: ...
     async def request_account_state(
         self,
         account_id: AccountId,
     ) -> AccountState: ...
+    async def request_order_status(
+        self,
+        account_id: AccountId,
+        instrument_id: InstrumentId,
+        order_side: OrderSide,
+        order_type: OrderType,
+        time_in_force: TimeInForce,
+        client_order_id: ClientOrderId | None = None,
+        venue_order_id: VenueOrderId | None = None,
+    ) -> OrderStatusReport: ...
     async def request_order_status_reports(
         self,
         account_id: AccountId,
@@ -5754,8 +5777,8 @@ class AxHttpClient:
     async def request_funding_rates(
         self,
         instrument_id: InstrumentId,
-        start_timestamp_ns: int,
-        end_timestamp_ns: int,
+        start: dt.datetime | None = None,
+        end: dt.datetime | None = None,
     ) -> list[FundingRateUpdate]: ...
     async def preview_aggressive_limit_order(
         self,
@@ -5781,8 +5804,16 @@ class AxMdWebSocketClient:
     def set_auth_token(self, token: str) -> None: ...
     def cache_instrument(self, instrument: Any) -> None: ...
     async def connect(self, callback: Callable[[Any], None]) -> None: ...
-    async def subscribe(self, symbol: str, level: AxMarketDataLevel) -> None: ...
-    async def unsubscribe(self, symbol: str) -> None: ...
+    async def subscribe_quotes(self, instrument_id: InstrumentId) -> None: ...
+    async def subscribe_trades(self, instrument_id: InstrumentId) -> None: ...
+    async def subscribe_book_deltas(
+        self, instrument_id: InstrumentId, level: AxMarketDataLevel
+    ) -> None: ...
+    async def subscribe_bars(self, bar_type: BarType) -> None: ...
+    async def unsubscribe_quotes(self, instrument_id: InstrumentId) -> None: ...
+    async def unsubscribe_trades(self, instrument_id: InstrumentId) -> None: ...
+    async def unsubscribe_book_deltas(self, instrument_id: InstrumentId) -> None: ...
+    async def unsubscribe_bars(self, bar_type: BarType) -> None: ...
     async def disconnect(self) -> None: ...
     async def close(self) -> None: ...
 
@@ -8686,6 +8717,7 @@ class BlackScholesGreeksResult:
     gamma: float
     vega: float
     theta: float
+    itm_prob: float
 
 def black_scholes_greeks(
     s: float,

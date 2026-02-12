@@ -55,7 +55,7 @@ config_node = TradingNodeConfig(
         # snapshot_orders=True,
         # snapshot_positions=True,
         # snapshot_positions_interval_secs=5.0,
-        open_check_interval_secs=0.0,
+        open_check_interval_secs=5.0,
         # manage_own_order_books=True,
     ),
     # cache=CacheConfig(
@@ -80,12 +80,7 @@ config_node = TradingNodeConfig(
         BINANCE: BinanceDataClientConfig(
             api_key=None,  # 'BINANCE_API_KEY' env var
             api_secret=None,  # 'BINANCE_API_SECRET' env var
-            # key_type=BinanceKeyType.ED25519,
             account_type=BinanceAccountType.SPOT,
-            base_url_http=None,  # Override with custom endpoint
-            base_url_ws=None,  # Override with custom endpoint
-            us=False,  # If client is for Binance US
-            testnet=False,  # If client uses the testnet
             instrument_provider=InstrumentProviderConfig(load_all=True),
         ),
     },
@@ -93,12 +88,7 @@ config_node = TradingNodeConfig(
         BINANCE: BinanceExecClientConfig(
             api_key=None,  # 'BINANCE_API_KEY' env var
             api_secret=None,  # 'BINANCE_API_SECRET' env var
-            # key_type=BinanceKeyType.ED25519,
             account_type=BinanceAccountType.SPOT,
-            base_url_http=None,  # Override with custom endpoint
-            base_url_ws=None,  # Override with custom endpoint
-            us=False,  # If client is for Binance US
-            testnet=False,  # If client uses the testnet
             instrument_provider=InstrumentProviderConfig(load_all=True),
             max_retries=3,
         ),
