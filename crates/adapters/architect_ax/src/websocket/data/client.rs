@@ -85,6 +85,7 @@ impl SymbolDataTypes {
         if let Some(level) = self.book_level {
             return Some(level);
         }
+
         if self.quotes || self.trades {
             return Some(AxMarketDataLevel::Level1);
         }
@@ -102,7 +103,10 @@ impl SymbolDataTypes {
 /// Requires Bearer token authentication obtained via the HTTP `/api/authenticate` endpoint.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.architect")
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.architect",
+        from_py_object
+    )
 )]
 pub struct AxMdWebSocketClient {
     url: String,
@@ -292,6 +296,7 @@ impl AxMdWebSocketClient {
         let ping_handler: PingHandler = Arc::new(move |_payload: Vec<u8>| {});
 
         let mut headers = vec![("User-Agent".to_string(), NAUTILUS_USER_AGENT.to_string())];
+
         if let Some(ref token) = self.auth_token {
             headers.push(("Authorization".to_string(), format!("Bearer {token}")));
         }
@@ -307,6 +312,7 @@ impl AxMdWebSocketClient {
             reconnect_backoff_factor: Some(1.5),
             reconnect_jitter_ms: Some(250),
             reconnect_max_attempts: None,
+            idle_timeout_ms: None,
         };
 
         // Retry initial connection with exponential backoff
@@ -772,6 +778,7 @@ impl AxMdWebSocketClient {
     ///
     /// Returns an error if the unsubscribe command cannot be sent.
     pub async fn unsubscribe_candles(&self, symbol: &str, width: AxCandleWidth) -> AxWsResult<()> {
+        let _guard = self.subscribe_lock.lock().await;
         let request_id = self.next_request_id();
         let topic = format!("candles:{symbol}:{width:?}");
 

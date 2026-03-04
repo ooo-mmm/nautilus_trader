@@ -22,7 +22,7 @@
 //! Tokio task within the lock-free I/O boundary.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fmt::Debug,
     sync::{
         Arc,
@@ -31,11 +31,16 @@ use std::{
 };
 
 use ahash::AHashMap;
-use nautilus_core::time::get_atomic_clock_realtime;
+use nautilus_core::{
+    UnixNanos,
+    time::{AtomicTime, get_atomic_clock_realtime},
+};
 use nautilus_model::{
     data::{
-        Bar, BarType, Data, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate, OrderBookDeltas,
+        Bar, BarType, Data, FundingRateUpdate, IndexPriceUpdate, InstrumentStatus, MarkPriceUpdate,
+        OrderBookDeltas,
     },
+    enums::MarketStatusAction,
     identifiers::{AccountId, InstrumentId},
     instruments::{Instrument, InstrumentAny},
     types::Price,
@@ -55,17 +60,17 @@ use super::{
     enums::{DydxWsChannel, DydxWsMessage, NautilusWsMessage},
     error::DydxWebSocketError,
     messages::{
-        DydxCandle, DydxMarketsContents, DydxOrderbookContents, DydxOrderbookSnapshotContents,
-        DydxSubscription, DydxTradeContents, DydxWsBlockHeightMessage, DydxWsCandlesMessage,
-        DydxWsChannelBatchDataMsg, DydxWsChannelDataMsg, DydxWsConnectedMsg, DydxWsFeedMessage,
-        DydxWsGenericMsg, DydxWsMarketsMessage, DydxWsOrderbookMessage,
-        DydxWsParentSubaccountsMessage, DydxWsSubaccountsChannelContents,
-        DydxWsSubaccountsChannelData, DydxWsSubaccountsMessage, DydxWsSubaccountsSubscribed,
-        DydxWsSubscriptionMsg, DydxWsTradesMessage,
+        DydxCandle, DydxMarketTradingUpdate, DydxMarketsContents, DydxOrderbookContents,
+        DydxOrderbookSnapshotContents, DydxSubscription, DydxTradeContents,
+        DydxWsBlockHeightMessage, DydxWsCandlesMessage, DydxWsChannelBatchDataMsg,
+        DydxWsChannelDataMsg, DydxWsConnectedMsg, DydxWsFeedMessage, DydxWsGenericMsg,
+        DydxWsMarketsMessage, DydxWsOrderbookMessage, DydxWsParentSubaccountsMessage,
+        DydxWsSubaccountsChannelContents, DydxWsSubaccountsChannelData, DydxWsSubaccountsMessage,
+        DydxWsSubaccountsSubscribed, DydxWsSubscriptionMsg, DydxWsTradesMessage,
     },
     parse as ws_parse,
 };
-use crate::common::parse::parse_instrument_id;
+use crate::common::{enums::DydxMarketStatus, parse::parse_instrument_id};
 
 /// Commands sent to the feed handler.
 #[derive(Debug, Clone)]
@@ -124,6 +129,8 @@ pub struct FeedHandler {
     pending_bars: AHashMap<String, Bar>,
     /// Whether to timestamp bars at close time (open + interval).
     bars_timestamp_on_close: bool,
+    /// High-resolution clock for timestamps.
+    clock: &'static AtomicTime,
 }
 
 impl Debug for FeedHandler {
@@ -166,12 +173,14 @@ impl FeedHandler {
             book_sequence: AHashMap::new(),
             pending_bars: AHashMap::new(),
             bars_timestamp_on_close,
+            clock: get_atomic_clock_realtime(),
         }
     }
 
-    /// Sends a WebSocket message with retry logic.
-    ///
-    /// Uses the configured [`RetryManager`] to handle transient failures.
+    fn generate_ts_init(&self) -> UnixNanos {
+        self.clock.get_time_ns()
+    }
+
     async fn send_with_retry(
         &self,
         payload: String,
@@ -227,7 +236,7 @@ impl FeedHandler {
                     let nautilus_msgs = self.process_raw_message(msg).await;
                     if !nautilus_msgs.is_empty() {
                         let mut iter = nautilus_msgs.into_iter();
-                        // SAFETY: We just checked that nautilus_msgs is not empty
+                        // We just checked that nautilus_msgs is not empty
                         let first = iter.next().expect("non-empty vec has first element");
                         self.message_buffer.extend(iter);
                         log::trace!("Handler sending message: {:?}", std::mem::discriminant(&first));
@@ -251,12 +260,12 @@ impl FeedHandler {
         }
     }
 
-    /// Processes a raw WebSocket message.
     async fn process_raw_message(&mut self, msg: Message) -> Vec<NautilusWsMessage> {
         match msg {
             Message::Text(txt) => {
                 if txt == RECONNECTED {
                     self.clear_state();
+
                     if let Err(e) = self.replay_subscriptions().await {
                         log::error!("Failed to replay subscriptions after reconnect: {e}");
                     }
@@ -287,6 +296,7 @@ impl FeedHandler {
                                     .map(DydxWsMessage::Connected)
                             } else if meta.is_subscribed() {
                                 log::debug!("Processing subscribed message via fallback path");
+
                                 if let Ok(sub_msg) =
                                     serde_json::from_value::<DydxWsSubscriptionMsg>(val.clone())
                                 {
@@ -356,7 +366,6 @@ impl FeedHandler {
         }
     }
 
-    /// Handles a parsed dYdX WebSocket message.
     async fn handle_dydx_message(&mut self, msg: DydxWsMessage) -> Vec<NautilusWsMessage> {
         match self.handle_message(msg).await {
             Ok(msgs) => msgs,
@@ -367,7 +376,6 @@ impl FeedHandler {
         }
     }
 
-    /// Dispatches feed messages directly to typed handlers.
     fn handle_feed_message(&mut self, feed_msg: DydxWsFeedMessage) -> Vec<NautilusWsMessage> {
         log::trace!(
             "Handling feed message: {:?}",
@@ -384,7 +392,6 @@ impl FeedHandler {
         }
     }
 
-    /// Handles subaccounts channel messages.
     fn handle_subaccounts(&self, msg: DydxWsSubaccountsMessage) -> Vec<NautilusWsMessage> {
         match msg {
             DydxWsSubaccountsMessage::Subscribed(data) => {
@@ -404,7 +411,6 @@ impl FeedHandler {
         }
     }
 
-    /// Handles orderbook channel messages.
     fn handle_orderbook(&mut self, msg: DydxWsOrderbookMessage) -> Vec<NautilusWsMessage> {
         match msg {
             DydxWsOrderbookMessage::Subscribed(data) => {
@@ -447,6 +453,7 @@ impl FeedHandler {
             DydxWsOrderbookMessage::Unsubscribed(data) => {
                 let topic = self.topic_from_msg(&DydxWsChannel::Orderbook, &data.id);
                 self.subscriptions.confirm_unsubscribe(&topic);
+
                 if let Some(id) = &data.id {
                     self.book_sequence.remove(id);
                 }
@@ -455,7 +462,6 @@ impl FeedHandler {
         }
     }
 
-    /// Handles trades channel messages.
     fn handle_trades(&self, msg: DydxWsTradesMessage) -> Vec<NautilusWsMessage> {
         match msg {
             DydxWsTradesMessage::Subscribed(data) => {
@@ -472,7 +478,6 @@ impl FeedHandler {
         }
     }
 
-    /// Handles markets channel messages.
     fn handle_markets_feed(&self, msg: DydxWsMarketsMessage) -> Vec<NautilusWsMessage> {
         match msg {
             DydxWsMarketsMessage::Subscribed(data) => {
@@ -489,10 +494,6 @@ impl FeedHandler {
         }
     }
 
-    /// Handles candles channel messages.
-    ///
-    /// Subscribed contents is `{"candles": [...]}` (array wrapper), while
-    /// channel_data contents is a single candle object.
     fn handle_candles_feed(&mut self, msg: DydxWsCandlesMessage) -> Vec<NautilusWsMessage> {
         match msg {
             DydxWsCandlesMessage::Subscribed(data) => {
@@ -509,7 +510,6 @@ impl FeedHandler {
         }
     }
 
-    /// Handles parent subaccounts channel messages.
     fn handle_parent_subaccounts(
         &self,
         msg: DydxWsParentSubaccountsMessage,
@@ -531,7 +531,6 @@ impl FeedHandler {
         }
     }
 
-    /// Handles block height channel messages.
     fn handle_block_height_feed(&self, msg: DydxWsBlockHeightMessage) -> Vec<NautilusWsMessage> {
         match msg {
             DydxWsBlockHeightMessage::Subscribed(data) => {
@@ -569,7 +568,6 @@ impl FeedHandler {
         }
     }
 
-    /// Processes subaccounts subscribed message.
     fn process_subaccounts_subscribed(
         &self,
         msg: &DydxWsSubaccountsSubscribed,
@@ -580,7 +578,6 @@ impl FeedHandler {
         ))]
     }
 
-    /// Processes subaccounts channel data directly.
     fn process_subaccounts_channel_data(
         &self,
         data: DydxWsSubaccountsChannelData,
@@ -600,7 +597,6 @@ impl FeedHandler {
         }
     }
 
-    /// Parses trades from channel data message.
     fn parse_trades_from_data(&self, data: &DydxWsChannelDataMsg) -> Vec<NautilusWsMessage> {
         match self.parse_trades(data) {
             Ok(msgs) => msgs,
@@ -611,7 +607,6 @@ impl FeedHandler {
         }
     }
 
-    /// Parses orderbook from channel data message.
     fn parse_orderbook_from_data(
         &mut self,
         data: &DydxWsChannelDataMsg,
@@ -626,7 +621,6 @@ impl FeedHandler {
         }
     }
 
-    /// Parses orderbook batch from batch data message.
     fn parse_orderbook_batch_from_data(
         &mut self,
         data: &DydxWsChannelBatchDataMsg,
@@ -640,7 +634,6 @@ impl FeedHandler {
         }
     }
 
-    /// Parses markets from channel data message.
     fn parse_markets_from_data(&self, data: &DydxWsChannelDataMsg) -> Vec<NautilusWsMessage> {
         match self.parse_markets(data) {
             Ok(msgs) => msgs,
@@ -651,7 +644,6 @@ impl FeedHandler {
         }
     }
 
-    /// Parses candles from channel data message (single candle object).
     fn parse_candles_from_data(&mut self, data: &DydxWsChannelDataMsg) -> Vec<NautilusWsMessage> {
         match self.parse_candles(data) {
             Ok(msgs) => msgs,
@@ -662,7 +654,6 @@ impl FeedHandler {
         }
     }
 
-    /// Parses parent subaccounts from channel data message.
     fn parse_parent_subaccounts_from_data(
         &self,
         data: &DydxWsChannelDataMsg,
@@ -676,7 +667,6 @@ impl FeedHandler {
         }
     }
 
-    /// Handles a command to update the internal state.
     async fn handle_command(&mut self, command: HandlerCommand) {
         match command {
             HandlerCommand::UpdateInstrument(instrument) => {
@@ -745,10 +735,6 @@ impl FeedHandler {
         }
     }
 
-    /// Clears transient state on reconnect.
-    ///
-    /// Preserves `instruments`, `bar_types`, and `subscription_messages` which are
-    /// needed for replay and parsing after reconnect.
     fn clear_state(&mut self) {
         let buffer_count = self.message_buffer.len();
         let seq_count = self.book_sequence.len();
@@ -823,6 +809,7 @@ impl FeedHandler {
             DydxWsMessage::Error(err) => Ok(vec![NautilusWsMessage::Error(err)]),
             DydxWsMessage::Reconnected => {
                 self.clear_state();
+
                 if let Err(e) = self.replay_subscriptions().await {
                     log::error!("Failed to replay subscriptions after reconnect message: {e}");
                 }
@@ -845,7 +832,7 @@ impl FeedHandler {
         let contents: DydxTradeContents = serde_json::from_value(data.contents.clone())
             .map_err(|e| DydxWsError::Parse(format!("Failed to parse trade contents: {e}")))?;
 
-        let ts_init = get_atomic_clock_realtime().get_time_ns();
+        let ts_init = self.generate_ts_init();
         let ticks = ws_parse::parse_trade_ticks(instrument_id, instrument, &contents, ts_init)?;
 
         if ticks.is_empty() {
@@ -870,7 +857,7 @@ impl FeedHandler {
         let price_prec = instrument.price_precision();
         let size_prec = instrument.size_precision();
 
-        let ts_init = get_atomic_clock_realtime().get_time_ns();
+        let ts_init = self.generate_ts_init();
 
         if is_snapshot {
             let contents: DydxOrderbookSnapshotContents =
@@ -922,7 +909,7 @@ impl FeedHandler {
         let contents: Vec<DydxOrderbookContents> = serde_json::from_value(data.contents.clone())
             .map_err(|e| DydxWsError::Parse(format!("Failed to parse orderbook batch: {e}")))?;
 
-        let ts_init = get_atomic_clock_realtime().get_time_ns();
+        let ts_init = self.generate_ts_init();
         let mut all_deltas = Vec::new();
 
         let num_messages = contents.len();
@@ -962,7 +949,7 @@ impl FeedHandler {
         let instrument_id = self.parse_instrument_id(&candle.ticker)?;
         let instrument = self.get_instrument(&instrument_id)?;
 
-        let ts_init = get_atomic_clock_realtime().get_time_ns();
+        let ts_init = self.generate_ts_init();
         let bar = ws_parse::parse_candle_bar(
             bar_type,
             instrument,
@@ -996,81 +983,134 @@ impl FeedHandler {
             .map_err(|e| DydxWsError::Parse(format!("Failed to parse markets contents: {e}")))?;
 
         let mut messages = Vec::new();
-        let ts_init = get_atomic_clock_realtime().get_time_ns();
+        let ts_init = self.generate_ts_init();
 
         // Parse oracle prices → MarkPriceUpdate + IndexPriceUpdate
         if let Some(oracle_prices) = &contents.oracle_prices {
             for (symbol_str, oracle_market) in oracle_prices {
-                let Ok(instrument_id) = self.parse_instrument_id(symbol_str) else {
-                    continue;
-                };
-                let Some(instrument) = self.instruments.get(&instrument_id.symbol.inner()) else {
-                    continue;
-                };
-                let Ok(oracle_price_dec) = oracle_market.oracle_price.parse::<Decimal>() else {
-                    log::error!("Failed to parse oracle price: market={symbol_str}");
-                    continue;
-                };
-                let Ok(price) =
-                    Price::from_decimal_dp(oracle_price_dec, instrument.price_precision())
-                else {
-                    log::error!("Failed to create Price: market={symbol_str}");
-                    continue;
-                };
-
-                messages.push(NautilusWsMessage::MarkPrice(MarkPriceUpdate::new(
-                    instrument_id,
-                    price,
+                self.emit_oracle_price(
+                    symbol_str,
+                    &oracle_market.oracle_price,
                     ts_init,
-                    ts_init,
-                )));
-                messages.push(NautilusWsMessage::IndexPrice(IndexPriceUpdate::new(
-                    instrument_id,
-                    price,
-                    ts_init,
-                    ts_init,
-                )));
+                    &mut messages,
+                );
             }
         }
 
-        // Parse trading data → FundingRateUpdate (and detect new instruments)
+        // Parse trading data → InstrumentStatus, FundingRateUpdate (and detect new instruments)
         if let Some(trading) = &contents.trading {
-            for (symbol_str, trading_data) in trading {
-                let Ok(instrument_id) = self.parse_instrument_id(symbol_str) else {
-                    continue;
-                };
+            self.parse_market_entries(trading, ts_init, &mut messages);
+        }
 
-                // Check if this is a new instrument not in our cache
-                if !self.instruments.contains_key(&instrument_id.symbol.inner()) {
+        // Parse initial subscription snapshot (uses "markets" key with full market objects)
+        if let Some(markets) = &contents.markets {
+            for (symbol_str, market_data) in markets {
+                if let Some(oracle_price_str) = &market_data.oracle_price {
+                    self.emit_oracle_price(symbol_str, oracle_price_str, ts_init, &mut messages);
+                }
+            }
+            self.parse_market_entries(markets, ts_init, &mut messages);
+        }
+
+        Ok(messages)
+    }
+
+    fn emit_oracle_price(
+        &self,
+        symbol_str: &str,
+        oracle_price_str: &str,
+        ts_init: UnixNanos,
+        messages: &mut Vec<NautilusWsMessage>,
+    ) {
+        let Ok(instrument_id) = self.parse_instrument_id(symbol_str) else {
+            return;
+        };
+        let Some(instrument) = self.instruments.get(&instrument_id.symbol.inner()) else {
+            return;
+        };
+        let Ok(oracle_price_dec) = oracle_price_str.parse::<Decimal>() else {
+            log::error!("Failed to parse oracle price: market={symbol_str}");
+            return;
+        };
+        let Ok(price) = Price::from_decimal_dp(oracle_price_dec, instrument.price_precision())
+        else {
+            log::error!("Failed to create Price: market={symbol_str}");
+            return;
+        };
+
+        messages.push(NautilusWsMessage::MarkPrice(MarkPriceUpdate::new(
+            instrument_id,
+            price,
+            ts_init,
+            ts_init,
+        )));
+        messages.push(NautilusWsMessage::IndexPrice(IndexPriceUpdate::new(
+            instrument_id,
+            price,
+            ts_init,
+            ts_init,
+        )));
+    }
+
+    fn parse_market_entries(
+        &self,
+        entries: &HashMap<String, DydxMarketTradingUpdate>,
+        ts_init: UnixNanos,
+        messages: &mut Vec<NautilusWsMessage>,
+    ) {
+        for (symbol_str, trading_data) in entries {
+            let Ok(instrument_id) = self.parse_instrument_id(symbol_str) else {
+                continue;
+            };
+
+            if !self.instruments.contains_key(&instrument_id.symbol.inner()) {
+                // Only discover instruments that are active or have unknown status
+                let is_active = trading_data
+                    .status
+                    .as_ref()
+                    .is_none_or(|s| matches!(s, DydxMarketStatus::Active));
+
+                if is_active {
                     log::info!("New instrument discovered via WebSocket: {symbol_str}");
                     messages.push(NautilusWsMessage::NewInstrumentDiscovered {
                         ticker: symbol_str.clone(),
                     });
-                    continue;
                 }
+                continue;
+            }
 
-                // Existing instrument - emit funding rate if available
-                let Some(rate_str) = &trading_data.next_funding_rate else {
-                    continue;
-                };
-                let Ok(rate) = rate_str.parse::<Decimal>() else {
-                    log::error!(
-                        "Failed to parse funding rate: market={symbol_str}, rate={rate_str}"
-                    );
-                    continue;
-                };
-
-                messages.push(NautilusWsMessage::FundingRate(FundingRateUpdate::new(
+            if let Some(status) = &trading_data.status {
+                let action = MarketStatusAction::from(*status);
+                let is_trading = matches!(status, DydxMarketStatus::Active);
+                messages.push(NautilusWsMessage::InstrumentStatus(InstrumentStatus::new(
                     instrument_id,
-                    rate,
+                    action,
+                    ts_init,
+                    ts_init,
                     None,
-                    ts_init,
-                    ts_init,
+                    None,
+                    Some(is_trading),
+                    None,
+                    None,
                 )));
             }
-        }
 
-        Ok(messages)
+            let Some(rate_str) = &trading_data.next_funding_rate else {
+                continue;
+            };
+            let Ok(rate) = rate_str.parse::<Decimal>() else {
+                log::error!("Failed to parse funding rate: market={symbol_str}, rate={rate_str}");
+                continue;
+            };
+
+            messages.push(NautilusWsMessage::FundingRate(FundingRateUpdate::new(
+                instrument_id,
+                rate,
+                None,
+                ts_init,
+                ts_init,
+            )));
+        }
     }
 
     fn parse_subaccounts(

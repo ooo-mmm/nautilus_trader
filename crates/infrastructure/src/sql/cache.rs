@@ -140,6 +140,7 @@ impl PostgresCacheDatabase {
                         buffer_interval,
                         &pool,
                     ).await;
+
                     if result.is_break() {
                         break;
                     }
@@ -229,6 +230,7 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
         tokio::task::block_in_place(|| {
             get_runtime().block_on(async {
                 pool.close().await;
+
                 if let Err(e) = tx.send(()) {
                     log::error!("Error closing pool: {e:?}");
                 }
@@ -262,6 +264,7 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
                 if let Err(e) = DatabaseQueries::truncate(&pool).await {
                     log::error!("Error flushing pool: {e:?}");
                 }
+
                 if let Err(e) = tx.send(()) {
                     log::error!("Error sending flush result: {e:?}");
                 }
@@ -311,6 +314,7 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
                         .into_iter()
                         .map(|(k, v)| (k, Bytes::from(v)))
                         .collect();
+
                     if let Err(e) = tx.send(mapping) {
                         log::error!("Failed to send general items: {e:?}");
                     }
@@ -338,6 +342,7 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
                         .into_iter()
                         .map(|currency| (currency.code, currency))
                         .collect();
+
                     if let Err(e) = tx.send(mapping) {
                         log::error!("Failed to send currencies: {e:?}");
                     }
@@ -365,6 +370,7 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
                         .into_iter()
                         .map(|instrument| (instrument.id(), instrument))
                         .collect();
+
                     if let Err(e) = tx.send(mapping) {
                         log::error!("Failed to send instruments: {e:?}");
                     }
@@ -396,6 +402,7 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
                         .into_iter()
                         .map(|account| (account.id(), account))
                         .collect();
+
                     if let Err(e) = tx.send(mapping) {
                         log::error!("Failed to send accounts: {e:?}");
                     }
@@ -423,6 +430,7 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
                         .into_iter()
                         .map(|order| (order.client_order_id(), order))
                         .collect();
+
                     if let Err(e) = tx.send(mapping) {
                         log::error!("Failed to send orders: {e:?}");
                     }
@@ -1009,9 +1017,27 @@ async fn drain_buffer(pool: &PgPool, buffer: &mut VecDeque<DatabaseQuery>) {
                     DatabaseQueries::add_instrument(pool, "OPTION_CONTRACT", Box::new(instrument))
                         .await
                 }
+                InstrumentAny::Commodity(instrument) => {
+                    DatabaseQueries::add_instrument(pool, "COMMODITY", Box::new(instrument)).await
+                }
+                InstrumentAny::IndexInstrument(instrument) => {
+                    DatabaseQueries::add_instrument(pool, "INDEX_INSTRUMENT", Box::new(instrument))
+                        .await
+                }
+                InstrumentAny::Cfd(instrument) => {
+                    DatabaseQueries::add_instrument(pool, "CFD", Box::new(instrument)).await
+                }
                 InstrumentAny::OptionSpread(instrument) => {
                     DatabaseQueries::add_instrument(pool, "OPTION_SPREAD", Box::new(instrument))
                         .await
+                }
+                InstrumentAny::PerpetualContract(instrument) => {
+                    DatabaseQueries::add_instrument(
+                        pool,
+                        "PERPETUAL_CONTRACT",
+                        Box::new(instrument),
+                    )
+                    .await
                 }
             },
             DatabaseQuery::AddOrder(order_any, client_id, updated) => match order_any {

@@ -51,7 +51,7 @@ pub const KRAKEN_FUTURES_WS_TOPIC_DELIMITER: char = ':';
 #[derive(Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.kraken")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.kraken", from_py_object)
 )]
 pub struct KrakenFuturesWebSocketClient {
     url: String,
@@ -261,6 +261,7 @@ impl KrakenFuturesWebSocketClient {
             reconnect_backoff_factor: Some(1.5),
             reconnect_jitter_ms: Some(250),
             reconnect_max_attempts: None,
+            idle_timeout_ms: None,
         };
 
         let ws_client =
@@ -322,6 +323,7 @@ impl KrakenFuturesWebSocketClient {
                                 if let Some(ref cred) = credential_for_reconnect {
                                     // Request fresh challenge for the new connection
                                     let (tx, rx) = tokio::sync::oneshot::channel();
+
                                     if let Err(e) = cmd_tx_for_reconnect.send(
                                         HandlerCommand::RequestChallenge {
                                             api_key: cred.api_key().to_string(),
@@ -439,7 +441,6 @@ impl KrakenFuturesWebSocketClient {
                             log::debug!("Output channel closed: {e}");
                             break;
                         }
-                        continue;
                     }
                     Some(msg) => {
                         if let Err(e) = out_tx.send(msg) {
@@ -848,6 +849,18 @@ impl KrakenFuturesWebSocketClient {
             })
         {
             log::debug!("Failed to cache client order: {e}");
+        }
+    }
+
+    /// Caches a truncated cl_ord_id mapping for reverse lookup.
+    pub fn cache_truncated_id(&self, truncated: String, original: ClientOrderId) {
+        if let Ok(tx) = self.cmd_tx.try_read()
+            && let Err(e) = tx.send(HandlerCommand::CacheTruncatedId {
+                truncated,
+                original,
+            })
+        {
+            log::debug!("Failed to cache truncated ID: {e}");
         }
     }
 

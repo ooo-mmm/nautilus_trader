@@ -58,7 +58,7 @@ const WS_PING_MSG: &str = r#"{"method":"ping"}"#;
 #[derive(Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.kraken")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.kraken", from_py_object)
 )]
 pub struct KrakenSpotWebSocketClient {
     url: String,
@@ -148,6 +148,7 @@ impl KrakenSpotWebSocketClient {
             reconnect_backoff_factor: Some(1.5),
             reconnect_jitter_ms: Some(250),
             reconnect_max_attempts: None,
+            idle_timeout_ms: None,
         };
 
         let ws_client = WebSocketClient::connect(
@@ -251,8 +252,8 @@ impl KrakenSpotWebSocketClient {
                                                 interval: None,
                                                 event_trigger: None,
                                                 token: Some(token.clone()),
-                                                snap_orders: Some(true),
-                                                snap_trades: Some(true),
+                                                snap_orders: Some(false),
+                                                snap_trades: Some(false),
                                             }),
                                             req_id: Some(req_id),
                                         };
@@ -360,7 +361,6 @@ impl KrakenSpotWebSocketClient {
                             log::error!("Failed to send message (receiver dropped)");
                             break;
                         }
-                        continue;
                     }
                     Some(msg) => {
                         if out_tx.send(msg).is_err() {
@@ -563,6 +563,18 @@ impl KrakenSpotWebSocketClient {
             })
         {
             log::debug!("Failed to send cache client order command to handler: {e}");
+        }
+    }
+
+    /// Caches a truncated cl_ord_id mapping for reverse lookup.
+    pub fn cache_truncated_id(&self, truncated: String, original: ClientOrderId) {
+        if let Ok(cmd_tx) = self.cmd_tx.try_read()
+            && let Err(e) = cmd_tx.send(SpotHandlerCommand::CacheTruncatedId {
+                truncated,
+                original,
+            })
+        {
+            log::debug!("Failed to send cache truncated ID command to handler: {e}");
         }
     }
 

@@ -183,6 +183,7 @@ pub fn parse_usdm_instrument(
         Some(default_margin),
         None, // maker_fee
         None, // taker_fee
+        None, // info
         ts_event,
         ts_init,
     );
@@ -284,6 +285,7 @@ pub fn parse_coinm_instrument(
         Some(default_margin),
         None, // maker_fee
         None, // taker_fee
+        None, // info
         ts_event,
         ts_init,
     );
@@ -426,6 +428,7 @@ pub fn parse_spot_instrument_sbe(
         Some(default_margin),
         None, // maker_fee
         None, // taker_fee
+        None, // info
         ts_event,
         ts_init,
     );
@@ -649,18 +652,23 @@ pub fn parse_order_status_report_sbe(
     if let Some(p) = price {
         report = report.with_price(p);
     }
+
     if let Some(ap) = avg_px {
         report = report.with_avg_px(ap.as_f64())?;
     }
+
     if let Some(tp) = trigger_price {
         report = report.with_trigger_price(tp);
     }
+
     if let Some(tt) = trigger_type {
         report = report.with_trigger_type(tt);
     }
+
     if let Some(oli) = order_list_id {
         report = report.with_order_list_id(oli);
     }
+
     if post_only {
         report = report.with_post_only(true);
     }
@@ -781,18 +789,23 @@ pub fn parse_new_order_response_sbe(
     if let Some(p) = price {
         report = report.with_price(p);
     }
+
     if let Some(ap) = avg_px {
         report = report.with_avg_px(ap.as_f64())?;
     }
+
     if let Some(tp) = trigger_price {
         report = report.with_trigger_price(tp);
     }
+
     if let Some(tt) = trigger_type {
         report = report.with_trigger_type(tt);
     }
+
     if let Some(oli) = order_list_id {
         report = report.with_order_list_id(oli);
     }
+
     if post_only {
         report = report.with_post_only(true);
     }

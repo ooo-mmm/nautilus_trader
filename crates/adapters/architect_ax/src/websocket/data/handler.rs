@@ -268,7 +268,6 @@ impl FeedHandler {
                         log::debug!("Stop signal received during idle period");
                         return None;
                     }
-                    continue;
                 }
 
                 msg = self.raw_rx.recv() => {
@@ -282,6 +281,7 @@ impl FeedHandler {
 
                     if let Message::Ping(data) = &msg {
                         log::trace!("Received ping frame with {} bytes", data.len());
+
                         if let Some(client) = &self.client
                             && let Err(e) = client.send_pong(data.to_vec()).await
                         {
@@ -313,6 +313,7 @@ impl FeedHandler {
                 log::debug!("Disconnect command received");
                 self.book_sequences.clear();
                 self.candle_cache.clear();
+
                 if let Some(client) = self.client.take() {
                     client.disconnect().await;
                 }
@@ -374,22 +375,23 @@ impl FeedHandler {
         }
     }
 
-    async fn send_subscribe(&self, request_id: i64, symbol: Ustr, level: AxMarketDataLevel) {
+    async fn send_subscribe(&mut self, request_id: i64, symbol: Ustr, level: AxMarketDataLevel) {
         let msg = AxMdSubscribe {
-            request_id,
+            rid: request_id,
             msg_type: AxMdRequestType::Subscribe,
             symbol,
             level,
         };
 
         if let Err(e) = self.send_json(&msg).await {
+            self.pending_subscribe_requests.remove(&request_id);
             log::error!("Failed to send subscribe message: {e}");
         }
     }
 
     async fn send_unsubscribe(&self, request_id: i64, symbol: Ustr) {
         let msg = AxMdUnsubscribe {
-            request_id,
+            rid: request_id,
             msg_type: AxMdRequestType::Unsubscribe,
             symbol,
         };
@@ -399,22 +401,28 @@ impl FeedHandler {
         }
     }
 
-    async fn send_subscribe_candles(&self, request_id: i64, symbol: Ustr, width: AxCandleWidth) {
+    async fn send_subscribe_candles(
+        &mut self,
+        request_id: i64,
+        symbol: Ustr,
+        width: AxCandleWidth,
+    ) {
         let msg = AxMdSubscribeCandles {
-            request_id,
+            rid: request_id,
             msg_type: AxMdRequestType::SubscribeCandles,
             symbol,
             width,
         };
 
         if let Err(e) = self.send_json(&msg).await {
+            self.pending_subscribe_requests.remove(&request_id);
             log::error!("Failed to send subscribe_candles message: {e}");
         }
     }
 
     async fn send_unsubscribe_candles(&self, request_id: i64, symbol: Ustr, width: AxCandleWidth) {
         let msg = AxMdUnsubscribeCandles {
-            request_id,
+            rid: request_id,
             msg_type: AxMdRequestType::UnsubscribeCandles,
             symbol,
             width,

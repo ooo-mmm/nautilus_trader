@@ -64,7 +64,7 @@ use ustr::Ustr;
 /// Configuration for the Nautilus logger.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.common")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.common", from_py_object)
 )]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoggerConfig {
@@ -193,6 +193,7 @@ impl LoggerConfig {
                 }
                 _ => {
                     let lvl = parse_level(v)?;
+
                     if k.contains("::") {
                         config.module_level.insert(Ustr::from(k), lvl);
                     } else {

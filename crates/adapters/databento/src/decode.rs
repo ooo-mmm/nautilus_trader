@@ -46,7 +46,7 @@
 
 use std::{ffi::c_char, num::NonZeroUsize};
 
-use databento::dbn::{self};
+use databento::dbn;
 use nautilus_core::{UnixNanos, datetime::NANOSECONDS_IN_SECOND, uuid::UUID4};
 use nautilus_model::{
     data::{
@@ -73,7 +73,6 @@ use super::{
     types::{DatabentoImbalance, DatabentoStatistics},
 };
 
-// SAFETY: Known valid value
 const STEP_ONE: NonZeroUsize = NonZeroUsize::new(1).unwrap();
 
 const BAR_SPEC_1S: BarSpecification = BarSpecification {
@@ -1194,14 +1193,15 @@ pub fn decode_equity(
         price_increment.precision,
         price_increment,
         Some(lot_size),
-        None, // TBD
-        None, // TBD
-        None, // TBD
-        None, // TBD
-        None, // TBD
-        None, // TBD
-        None, // TBD
-        None, // TBD
+        None, // max_quantity
+        None, // min_quantity
+        None, // max_price
+        None, // min_price
+        None, // margin_init
+        None, // margin_maint
+        None, // maker_fee
+        None, // taker_fee
+        None, // info
         ts_event,
         ts_init,
     ))
@@ -1240,14 +1240,15 @@ pub fn decode_futures_contract(
         price_increment,
         multiplier,
         lot_size,
-        None, // TBD
-        None, // TBD
-        None, // TBD
-        None, // TBD
-        None, // TBD
-        None, // TBD
-        None, // TBD
-        None, // TBD
+        None, // max_quantity
+        None, // min_quantity
+        None, // max_price
+        None, // min_price
+        None, // margin_init
+        None, // margin_maint
+        None, // maker_fee
+        None, // taker_fee
+        None, // info
         ts_event,
         ts_init,
     )
@@ -1288,14 +1289,15 @@ pub fn decode_futures_spread(
         price_increment,
         multiplier,
         lot_size,
-        None, // TBD
-        None, // TBD
-        None, // TBD
-        None, // TBD
-        None, // TBD
-        None, // TBD
-        None, // TBD
-        None, // TBD
+        None, // max_quantity
+        None, // min_quantity
+        None, // max_price
+        None, // min_price
+        None, // margin_init
+        None, // margin_maint
+        None, // maker_fee
+        None, // taker_fee
+        None, // info
         ts_event,
         ts_init,
     )
@@ -1348,14 +1350,15 @@ pub fn decode_option_contract(
         price_increment,
         multiplier,
         lot_size,
-        None, // TBD
-        None, // TBD
-        None, // TBD
-        None, // TBD
-        None, // TBD
-        None, // TBD
-        None, // TBD
-        None, // TBD
+        None, // max_quantity
+        None, // min_quantity
+        None, // max_price
+        None, // min_price
+        None, // margin_init
+        None, // margin_maint
+        None, // maker_fee
+        None, // taker_fee
+        None, // info
         ts_event,
         ts_init,
     )
@@ -1401,14 +1404,15 @@ pub fn decode_option_spread(
         price_increment,
         multiplier,
         lot_size,
-        None, // TBD
-        None, // TBD
-        None, // TBD
-        None, // TBD
-        None, // TBD
-        None, // TBD
-        None, // TBD
-        None, // TBD
+        None, // max_quantity
+        None, // min_quantity
+        None, // max_price
+        None, // min_price
+        None, // margin_init
+        None, // margin_maint
+        None, // maker_fee
+        None, // taker_fee
+        None, // info
         ts_event,
         ts_init,
     )

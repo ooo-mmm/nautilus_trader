@@ -101,7 +101,10 @@ impl From<&'static str> for AxOrdersWsClientError {
 /// and monitoring order status via WebSocket.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.architect")
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.architect",
+        from_py_object
+    )
 )]
 pub struct AxOrdersWebSocketClient {
     clock: &'static AtomicTime,
@@ -355,6 +358,7 @@ impl AxOrdersWebSocketClient {
             reconnect_backoff_factor: Some(1.5),
             reconnect_jitter_ms: Some(250),
             reconnect_max_attempts: None,
+            idle_timeout_ms: None,
         };
 
         // Retry initial connection with exponential backoff
@@ -653,7 +657,7 @@ impl AxOrdersWebSocketClient {
 
     /// Cancels an order via WebSocket.
     ///
-    /// Uses `venue_order_id` if available, otherwise falls back to `client_order_id`.
+    /// Requires a known `venue_order_id`.
     ///
     /// # Errors
     ///
@@ -663,8 +667,11 @@ impl AxOrdersWebSocketClient {
         client_order_id: ClientOrderId,
         venue_order_id: Option<VenueOrderId>,
     ) -> AxOrdersWsResult<i64> {
-        let order_id =
-            venue_order_id.map_or_else(|| client_order_id.to_string(), |v| v.to_string());
+        let order_id = venue_order_id.map(|v| v.to_string()).ok_or_else(|| {
+            AxOrdersWsClientError::ClientError(format!(
+                "Cannot cancel order {client_order_id}: missing venue_order_id"
+            ))
+        })?;
 
         let request_id = self.next_request_id();
 
@@ -746,5 +753,65 @@ impl AxOrdersWebSocketClient {
         guard
             .send(cmd)
             .map_err(|e| AxOrdersWsClientError::ChannelError(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_cancel_order_rejects_without_venue_order_id() {
+        let client = AxOrdersWebSocketClient::new(
+            "wss://example.com/orders/ws".to_string(),
+            AccountId::from("AX-001"),
+            TraderId::from("TRADER-001"),
+            Some(30),
+        );
+        let client_order_id = ClientOrderId::from("CID-123");
+
+        let result = client.cancel_order(client_order_id, None).await;
+
+        assert!(matches!(
+            result,
+            Err(AxOrdersWsClientError::ClientError(msg))
+            if msg.contains("missing venue_order_id")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_order_sends_known_venue_order_id() {
+        let mut client = AxOrdersWebSocketClient::new(
+            "wss://example.com/orders/ws".to_string(),
+            AccountId::from("AX-001"),
+            TraderId::from("TRADER-001"),
+            Some(30),
+        );
+
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
+        client.cmd_tx = Arc::new(tokio::sync::RwLock::new(cmd_tx));
+
+        let client_order_id = ClientOrderId::from("CID-456");
+        let venue_order_id = VenueOrderId::from("V-ORDER-789");
+
+        let request_id = client
+            .cancel_order(client_order_id, Some(venue_order_id))
+            .await
+            .unwrap();
+
+        assert_eq!(request_id, 1);
+        let cmd = cmd_rx.recv().await.unwrap();
+        match cmd {
+            HandlerCommand::CancelOrder {
+                request_id,
+                order_id,
+            } => {
+                assert_eq!(request_id, 1);
+                assert_eq!(order_id, "V-ORDER-789");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 }

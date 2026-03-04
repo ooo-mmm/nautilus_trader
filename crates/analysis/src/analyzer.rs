@@ -43,7 +43,7 @@ pub type Statistic = Arc<dyn PortfolioStatistic<Item = f64> + Send + Sync>;
 /// Analyzes portfolio performance and calculates various statistics.
 ///
 /// The `PortfolioAnalyzer` tracks account balances, positions, and realized PnLs
-/// to provide comprehensive portfolio analysis including returns, PnL calculations,
+/// to provide portfolio analysis including returns, PnL calculations,
 /// and customizable statistics.
 #[repr(C)]
 #[derive(Debug)]
@@ -208,17 +208,13 @@ impl PortfolioAnalyzer {
 
     /// Calculates total PnL including unrealized PnL if provided.
     ///
-    /// # Panics
-    ///
-    /// This function does not panic. The internal `expect` is guarded by a length
-    /// check ensuring at least one currency exists.
-    ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - No currency is specified in a multi-currency portfolio.
     /// - The specified currency is not found in account balances.
     /// - The unrealized PnL currency does not match the specified currency.
+    #[allow(clippy::missing_panics_doc)] // Guarded by length check
     pub fn total_pnl(
         &self,
         currency: Option<&Currency>,
@@ -232,7 +228,6 @@ impl PortfolioAnalyzer {
         let currency = match currency {
             Some(c) => c,
             None if self.account_balances.len() == 1 => {
-                // SAFETY: Length is 1, so next() always returns Some
                 self.account_balances.keys().next().expect("len is 1")
             }
             None => return Err("Currency must be specified for multi-currency portfolio"),
@@ -261,17 +256,13 @@ impl PortfolioAnalyzer {
 
     /// Calculates total PnL as a percentage of starting balance.
     ///
-    /// # Panics
-    ///
-    /// This function does not panic. The internal `expect` is guarded by a length
-    /// check ensuring at least one currency exists.
-    ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - No currency is specified in a multi-currency portfolio.
     /// - The specified currency is not found in account balances.
     /// - The unrealized PnL currency does not match the specified currency.
+    #[allow(clippy::missing_panics_doc)] // Guarded by length check
     pub fn total_pnl_percentage(
         &self,
         currency: Option<&Currency>,
@@ -285,7 +276,6 @@ impl PortfolioAnalyzer {
         let currency = match currency {
             Some(c) => c,
             None if self.account_balances.len() == 1 => {
-                // SAFETY: Length is 1, so next() always returns Some
                 self.account_balances.keys().next().expect("len is 1")
             }
             None => return Err("Currency must be specified for multi-currency portfolio"),
@@ -626,7 +616,7 @@ mod tests {
         }
         fn calculate_balance_locked(
             &mut self,
-            _: InstrumentAny,
+            _: &InstrumentAny,
             _: OrderSide,
             _: Quantity,
             _: Price,
@@ -636,15 +626,15 @@ mod tests {
         }
         fn calculate_pnls(
             &self,
-            _: InstrumentAny,
-            _: OrderFilled,
+            _: &InstrumentAny,
+            _: &OrderFilled,
             _: Option<Position>,
         ) -> Result<Vec<Money>, anyhow::Error> {
             todo!()
         }
         fn calculate_commission(
             &self,
-            _: InstrumentAny,
+            _: &InstrumentAny,
             _: Quantity,
             _: Price,
             _: LiquiditySide,

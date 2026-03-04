@@ -315,10 +315,8 @@ pub fn calculate_reconciliation_price(
 ///
 /// Returns `FillAdjustmentResult` indicating what adjustments (if any) are needed.
 ///
-/// # Panics
-///
-/// This function does not panic under normal circumstances as all unwrap calls are guarded by prior checks.
 #[must_use]
+#[allow(clippy::missing_panics_doc)] // All unwraps guarded by prior checks
 pub fn adjust_fills_for_partial_window(
     fills: &[FillSnapshot],
     venue_position: &VenuePositionSnapshot,
@@ -805,6 +803,7 @@ fn extract_instrument_reports(
             .filter(|f| f.instrument_id == instrument_id)
             .cloned()
             .collect();
+
         if !filtered.is_empty() {
             fills.insert(id, filtered);
         }
@@ -1298,6 +1297,7 @@ fn reconcile_fill_quantity_mismatch(
         // (matching Python behavior in _handle_fill_quantity_mismatch)
         if order.is_closed() {
             let precision = order_filled_qty.precision.max(report_filled_qty.precision);
+
             if is_within_single_unit_tolerance(
                 report_filled_qty.as_decimal(),
                 order_filled_qty.as_decimal(),
@@ -1495,9 +1495,11 @@ fn calculate_incremental_fill_price(
         if let Some(avg_px) = report.avg_px {
             return Price::from_decimal_dp(avg_px, instrument.price_precision()).ok();
         }
+
         if let Some(price) = report.price {
             return Some(price);
         }
+
         if let Some(price) = order.price() {
             return Some(price);
         }

@@ -29,6 +29,7 @@ use nautilus_common::{
     log_info,
     timer::TimeEvent,
 };
+use nautilus_core::Params;
 use nautilus_model::{
     data::{
         Bar, FundingRateUpdate, IndexPriceUpdate, InstrumentClose, InstrumentStatus,
@@ -75,7 +76,10 @@ pub struct DataTesterConfig {
     pub subscribe_instrument_status: bool,
     /// Whether to subscribe to instrument close.
     pub subscribe_instrument_close: bool,
-    // TODO: Support subscribe_params when we have a type-safe way to pass arbitrary params
+    /// Optional parameters passed to all subscribe calls.
+    pub subscribe_params: Option<Params>,
+    /// Optional parameters passed to all request calls.
+    pub request_params: Option<Params>,
     /// Whether unsubscribe is supported on stop.
     pub can_unsubscribe: bool,
     /// Whether to request instruments on start.
@@ -139,6 +143,8 @@ impl DataTesterConfig {
             subscribe_instrument: false,
             subscribe_instrument_status: false,
             subscribe_instrument_close: false,
+            subscribe_params: None,
+            request_params: None,
             can_unsubscribe: true,
             request_instruments: false,
             request_quotes: false,
@@ -296,14 +302,38 @@ impl DataTesterConfig {
     }
 
     #[must_use]
+    pub fn with_request_quotes(mut self, request: bool) -> Self {
+        self.request_quotes = request;
+        self
+    }
+
+    #[must_use]
     pub fn with_request_funding_rates(mut self, request: bool) -> Self {
         self.request_funding_rates = request;
         self
     }
 
     #[must_use]
+    pub fn with_book_levels_to_print(mut self, levels: usize) -> Self {
+        self.book_levels_to_print = levels;
+        self
+    }
+
+    #[must_use]
     pub fn with_can_unsubscribe(mut self, can_unsubscribe: bool) -> Self {
         self.can_unsubscribe = can_unsubscribe;
+        self
+    }
+
+    #[must_use]
+    pub fn with_subscribe_params(mut self, params: Option<Params>) -> Self {
+        self.subscribe_params = params;
+        self
+    }
+
+    #[must_use]
+    pub fn with_request_params(mut self, params: Option<Params>) -> Self {
+        self.request_params = params;
         self
     }
 
@@ -333,6 +363,8 @@ impl Default for DataTesterConfig {
             subscribe_instrument: false,
             subscribe_instrument_status: false,
             subscribe_instrument_close: false,
+            subscribe_params: None,
+            request_params: None,
             can_unsubscribe: true,
             request_instruments: false,
             request_quotes: false,
@@ -385,6 +417,8 @@ impl DataActor for DataTester {
     fn on_start(&mut self) -> anyhow::Result<()> {
         let instrument_ids = self.config.instrument_ids.clone();
         let client_id = self.config.client_id;
+        let subscribe_params = self.config.subscribe_params.clone();
+        let request_params = self.config.request_params.clone();
         let stats_interval_secs = self.config.stats_interval_secs;
 
         // Request instruments if configured
@@ -395,14 +429,20 @@ impl DataActor for DataTester {
             }
 
             for venue in venues {
-                let _ = self.request_instruments(Some(venue), None, None, client_id, None);
+                let _ = self.request_instruments(
+                    Some(venue),
+                    None,
+                    None,
+                    client_id,
+                    request_params.clone(),
+                );
             }
         }
 
         // Subscribe to data for each instrument
         for instrument_id in instrument_ids {
             if self.config.subscribe_instrument {
-                self.subscribe_instrument(instrument_id, client_id, None);
+                self.subscribe_instrument(instrument_id, client_id, subscribe_params.clone());
             }
 
             if self.config.subscribe_book_deltas {
@@ -412,7 +452,7 @@ impl DataActor for DataTester {
                     None,
                     client_id,
                     self.config.manage_book,
-                    None,
+                    subscribe_params.clone(),
                 );
 
                 if self.config.manage_book {
@@ -428,7 +468,7 @@ impl DataActor for DataTester {
                     self.config.book_depth,
                     self.config.book_interval_ms,
                     client_id,
-                    None,
+                    subscribe_params.clone(),
                 );
             }
 
@@ -439,36 +479,40 @@ impl DataActor for DataTester {
             //         self.config.book_type,
             //         self.config.book_depth,
             //         client_id,
-            //         None,
+            //         subscribe_params.clone(),
             //     );
             // }
 
             if self.config.subscribe_quotes {
-                self.subscribe_quotes(instrument_id, client_id, None);
+                self.subscribe_quotes(instrument_id, client_id, subscribe_params.clone());
             }
 
             if self.config.subscribe_trades {
-                self.subscribe_trades(instrument_id, client_id, None);
+                self.subscribe_trades(instrument_id, client_id, subscribe_params.clone());
             }
 
             if self.config.subscribe_mark_prices {
-                self.subscribe_mark_prices(instrument_id, client_id, None);
+                self.subscribe_mark_prices(instrument_id, client_id, subscribe_params.clone());
             }
 
             if self.config.subscribe_index_prices {
-                self.subscribe_index_prices(instrument_id, client_id, None);
+                self.subscribe_index_prices(instrument_id, client_id, subscribe_params.clone());
             }
 
             if self.config.subscribe_funding_rates {
-                self.subscribe_funding_rates(instrument_id, client_id, None);
+                self.subscribe_funding_rates(instrument_id, client_id, subscribe_params.clone());
             }
 
             if self.config.subscribe_instrument_status {
-                self.subscribe_instrument_status(instrument_id, client_id, None);
+                self.subscribe_instrument_status(
+                    instrument_id,
+                    client_id,
+                    subscribe_params.clone(),
+                );
             }
 
             if self.config.subscribe_instrument_close {
-                self.subscribe_instrument_close(instrument_id, client_id, None);
+                self.subscribe_instrument_close(instrument_id, client_id, subscribe_params.clone());
             }
 
             // TODO: Implement historical data requests
@@ -482,7 +526,7 @@ impl DataActor for DataTester {
                     instrument_id,
                     self.config.book_depth,
                     client_id,
-                    None,
+                    request_params.clone(),
                 );
             }
 
@@ -491,13 +535,14 @@ impl DataActor for DataTester {
             // Request historical trades (default to last 1 hour)
             if self.config.request_trades {
                 let start = self.clock().utc_now() - ChronoDuration::hours(1);
+
                 if let Err(e) = self.request_trades(
                     instrument_id,
                     Some(start),
-                    None, // end: None means "now"
-                    None, // limit: None means use API default
+                    None,
+                    None,
                     client_id,
-                    None, // params
+                    request_params.clone(),
                 ) {
                     log::error!("Failed to request trades for {instrument_id}: {e}");
                 }
@@ -506,13 +551,14 @@ impl DataActor for DataTester {
             // Request historical funding rates (default to last 7 days)
             if self.config.request_funding_rates {
                 let start = self.clock().utc_now() - ChronoDuration::days(7);
+
                 if let Err(e) = self.request_funding_rates(
                     instrument_id,
                     Some(start),
                     None,
                     None,
                     client_id,
-                    None,
+                    request_params.clone(),
                 ) {
                     log::error!("Failed to request funding rates for {instrument_id}: {e}");
                 }
@@ -523,19 +569,20 @@ impl DataActor for DataTester {
         if let Some(bar_types) = self.config.bar_types.clone() {
             for bar_type in bar_types {
                 if self.config.subscribe_bars {
-                    self.subscribe_bars(bar_type, client_id, None);
+                    self.subscribe_bars(bar_type, client_id, subscribe_params.clone());
                 }
 
                 // Request historical bars (default to last 1 hour)
                 if self.config.request_bars {
                     let start = self.clock().utc_now() - ChronoDuration::hours(1);
+
                     if let Err(e) = self.request_bars(
                         bar_type,
                         Some(start),
-                        None, // end: None means "now"
-                        None, // limit: None means use API default
+                        None,
+                        None,
                         client_id,
-                        None, // params
+                        request_params.clone(),
                     ) {
                         log::error!("Failed to request bars for {bar_type}: {e}");
                     }
@@ -566,14 +613,15 @@ impl DataActor for DataTester {
 
         let instrument_ids = self.config.instrument_ids.clone();
         let client_id = self.config.client_id;
+        let subscribe_params = self.config.subscribe_params.clone();
 
         for instrument_id in instrument_ids {
             if self.config.subscribe_instrument {
-                self.unsubscribe_instrument(instrument_id, client_id, None);
+                self.unsubscribe_instrument(instrument_id, client_id, subscribe_params.clone());
             }
 
             if self.config.subscribe_book_deltas {
-                self.unsubscribe_book_deltas(instrument_id, client_id, None);
+                self.unsubscribe_book_deltas(instrument_id, client_id, subscribe_params.clone());
             }
 
             if self.config.subscribe_book_at_interval {
@@ -581,48 +629,56 @@ impl DataActor for DataTester {
                     instrument_id,
                     self.config.book_interval_ms,
                     client_id,
-                    None,
+                    subscribe_params.clone(),
                 );
             }
 
             // TODO: Support unsubscribe_book_depth when the method is available
             // if self.config.subscribe_book_depth {
-            //     self.unsubscribe_book_depth(instrument_id, client_id, None);
+            //     self.unsubscribe_book_depth(instrument_id, client_id, subscribe_params.clone());
             // }
 
             if self.config.subscribe_quotes {
-                self.unsubscribe_quotes(instrument_id, client_id, None);
+                self.unsubscribe_quotes(instrument_id, client_id, subscribe_params.clone());
             }
 
             if self.config.subscribe_trades {
-                self.unsubscribe_trades(instrument_id, client_id, None);
+                self.unsubscribe_trades(instrument_id, client_id, subscribe_params.clone());
             }
 
             if self.config.subscribe_mark_prices {
-                self.unsubscribe_mark_prices(instrument_id, client_id, None);
+                self.unsubscribe_mark_prices(instrument_id, client_id, subscribe_params.clone());
             }
 
             if self.config.subscribe_index_prices {
-                self.unsubscribe_index_prices(instrument_id, client_id, None);
+                self.unsubscribe_index_prices(instrument_id, client_id, subscribe_params.clone());
             }
 
             if self.config.subscribe_funding_rates {
-                self.unsubscribe_funding_rates(instrument_id, client_id, None);
+                self.unsubscribe_funding_rates(instrument_id, client_id, subscribe_params.clone());
             }
 
             if self.config.subscribe_instrument_status {
-                self.unsubscribe_instrument_status(instrument_id, client_id, None);
+                self.unsubscribe_instrument_status(
+                    instrument_id,
+                    client_id,
+                    subscribe_params.clone(),
+                );
             }
 
             if self.config.subscribe_instrument_close {
-                self.unsubscribe_instrument_close(instrument_id, client_id, None);
+                self.unsubscribe_instrument_close(
+                    instrument_id,
+                    client_id,
+                    subscribe_params.clone(),
+                );
             }
         }
 
         if let Some(bar_types) = self.config.bar_types.clone() {
             for bar_type in bar_types {
                 if self.config.subscribe_bars {
-                    self.unsubscribe_bars(bar_type, client_id, None);
+                    self.unsubscribe_bars(bar_type, client_id, subscribe_params.clone());
                 }
             }
         }
@@ -737,6 +793,7 @@ impl DataActor for DataTester {
             for trade in trades.iter().take(5) {
                 log_info!("  {trade:?}", color = LogColor::Cyan);
             }
+
             if trades.len() > 5 {
                 log_info!(
                     "  ... and {} more trades",
@@ -761,6 +818,7 @@ impl DataActor for DataTester {
             for rate in funding_rates.iter().take(5) {
                 log_info!("  {rate:?}", color = LogColor::Cyan);
             }
+
             if funding_rates.len() > 5 {
                 log_info!(
                     "  ... and {} more funding rates",
@@ -782,6 +840,7 @@ impl DataActor for DataTester {
             for bar in bars.iter().take(5) {
                 log_info!("  {bar:?}", color = LogColor::Cyan);
             }
+
             if bars.len() > 5 {
                 log_info!(
                     "  ... and {} more bars",
@@ -808,7 +867,7 @@ impl DataTester {
 
 #[cfg(test)]
 mod tests {
-    use nautilus_core::UnixNanos;
+    use nautilus_core::{UUID4, UnixNanos};
     use nautilus_model::{
         data::OrderBookDelta,
         enums::{InstrumentCloseType, MarketStatusAction},
@@ -865,6 +924,27 @@ mod tests {
         assert!(!config.request_funding_rates);
         assert!(config.can_unsubscribe);
         assert!(config.log_data);
+        assert!(config.subscribe_params.is_none());
+        assert!(config.request_params.is_none());
+    }
+
+    #[rstest]
+    fn test_config_with_params() {
+        let client_id = ClientId::new("TEST");
+        let instrument_ids = vec![InstrumentId::from("BTC-USDT.TEST")];
+
+        let mut sub_params = Params::new();
+        sub_params.insert("key".to_string(), serde_json::json!("value"));
+
+        let mut req_params = Params::new();
+        req_params.insert("limit".to_string(), serde_json::json!(100));
+
+        let config = DataTesterConfig::new(client_id, instrument_ids)
+            .with_subscribe_params(Some(sub_params.clone()))
+            .with_request_params(Some(req_params.clone()));
+
+        assert_eq!(config.subscribe_params, Some(sub_params));
+        assert_eq!(config.request_params, Some(req_params));
     }
 
     #[rstest]
@@ -942,6 +1022,7 @@ mod tests {
             None,
             None,
             None,
+            None, // info
             UnixNanos::default(),
             UnixNanos::default(),
         );
@@ -1105,7 +1186,7 @@ mod tests {
 
         let event = TimeEvent::new(
             "TEST".into(),
-            Default::default(),
+            UUID4::default(),
             UnixNanos::default(),
             UnixNanos::default(),
         );

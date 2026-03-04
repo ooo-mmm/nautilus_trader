@@ -37,7 +37,7 @@ use crate::{
         credential::{DydxCredential, resolve_wallet_address},
         urls,
     },
-    config::{DYDXExecClientConfig, DydxAdapterConfig, DydxDataClientConfig},
+    config::{DydxAdapterConfig, DydxDataClientConfig, DydxExecClientConfig},
     data::DydxDataClient,
     execution::DydxExecutionClient,
     http::client::DydxHttpClient,
@@ -50,14 +50,18 @@ impl ClientConfig for DydxDataClientConfig {
     }
 }
 
-impl ClientConfig for DYDXExecClientConfig {
+impl ClientConfig for DydxExecClientConfig {
     fn as_any(&self) -> &dyn Any {
         self
     }
 }
 
 /// Factory for creating dYdX data clients.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.dydx", from_py_object)
+)]
 pub struct DydxDataClientFactory;
 
 impl DydxDataClientFactory {
@@ -141,7 +145,11 @@ impl DataClientFactory for DydxDataClientFactory {
 }
 
 /// Factory for creating dYdX execution clients.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.dydx", from_py_object)
+)]
 pub struct DydxExecutionClientFactory;
 
 impl DydxExecutionClientFactory {
@@ -167,10 +175,10 @@ impl ExecutionClientFactory for DydxExecutionClientFactory {
     ) -> anyhow::Result<Box<dyn ExecutionClient>> {
         let dydx_config = config
             .as_any()
-            .downcast_ref::<DYDXExecClientConfig>()
+            .downcast_ref::<DydxExecClientConfig>()
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Invalid config type for DydxExecutionClientFactory. Expected DYDXExecClientConfig, was {config:?}",
+                    "Invalid config type for DydxExecutionClientFactory. Expected DydxExecClientConfig, was {config:?}",
                 )
             })?
             .clone();
@@ -212,6 +220,7 @@ impl ExecutionClientFactory for DydxExecutionClientFactory {
             max_retries: dydx_config.max_retries.unwrap_or(3),
             retry_delay_initial_ms: dydx_config.retry_delay_initial_ms.unwrap_or(1000),
             retry_delay_max_ms: dydx_config.retry_delay_max_ms.unwrap_or(10000),
+            grpc_rate_limit_per_second: dydx_config.grpc_rate_limit_per_second,
         };
 
         log::info!(
@@ -260,7 +269,7 @@ impl ExecutionClientFactory for DydxExecutionClientFactory {
     }
 
     fn config_type(&self) -> &'static str {
-        "DYDXExecClientConfig"
+        "DydxExecClientConfig"
     }
 }
 
@@ -276,7 +285,7 @@ mod tests {
     use super::*;
     use crate::{
         common::enums::DydxNetwork,
-        config::{DYDXExecClientConfig, DydxDataClientConfig},
+        config::{DydxDataClientConfig, DydxExecClientConfig},
     };
 
     #[rstest]
@@ -296,7 +305,7 @@ mod tests {
     fn test_dydx_execution_client_factory_creation() {
         let factory = DydxExecutionClientFactory::new();
         assert_eq!(factory.name(), "DYDX");
-        assert_eq!(factory.config_type(), "DYDXExecClientConfig");
+        assert_eq!(factory.config_type(), "DydxExecClientConfig");
     }
 
     #[rstest]
@@ -316,7 +325,7 @@ mod tests {
 
     #[rstest]
     fn test_dydx_exec_client_config_implements_client_config() {
-        let config = DYDXExecClientConfig {
+        let config = DydxExecClientConfig {
             trader_id: TraderId::from("TRADER-001"),
             account_id: AccountId::from("DYDX-001"),
             network: DydxNetwork::Mainnet,
@@ -332,10 +341,11 @@ mod tests {
             max_retries: None,
             retry_delay_initial_ms: None,
             retry_delay_max_ms: None,
+            grpc_rate_limit_per_second: Some(4),
         };
 
         let boxed_config: Box<dyn ClientConfig> = Box::new(config);
-        let downcasted = boxed_config.as_any().downcast_ref::<DYDXExecClientConfig>();
+        let downcasted = boxed_config.as_any().downcast_ref::<DydxExecClientConfig>();
 
         assert!(downcasted.is_some());
     }
@@ -343,7 +353,7 @@ mod tests {
     #[rstest]
     fn test_dydx_data_client_factory_rejects_wrong_config_type() {
         let factory = DydxDataClientFactory::new();
-        let wrong_config = DYDXExecClientConfig {
+        let wrong_config = DydxExecClientConfig {
             trader_id: TraderId::from("TRADER-001"),
             account_id: AccountId::from("DYDX-001"),
             network: DydxNetwork::Mainnet,
@@ -359,6 +369,7 @@ mod tests {
             max_retries: None,
             retry_delay_initial_ms: None,
             retry_delay_max_ms: None,
+            grpc_rate_limit_per_second: Some(4),
         };
 
         let cache = Rc::new(RefCell::new(Cache::default()));

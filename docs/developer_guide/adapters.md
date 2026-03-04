@@ -2,14 +2,15 @@
 
 ## Introduction
 
-This developer guide provides specifications and instructions on how to develop an integration adapter for the NautilusTrader platform.
-Adapters provide connectivity to trading venues and data providers—translating raw venue APIs into Nautilus’s unified interface and normalized domain model.
+This developer guide provides specifications for how to build an integration adapter for the NautilusTrader platform.
+
+Adapters connect to trading venues and data providers, translating their native APIs into the platform’s unified interface and normalized domain model.
 
 ## Structure of an adapter
 
 NautilusTrader adapters follow a layered architecture pattern with:
 
-- **Rust core** for networking clients and performance-critical operations.
+- **Rust core** for networking clients and performance-sensitive operations.
 - **Python layer** for integrating Rust clients into the platform's data and execution engines.
 
 ### Rust core (`crates/adapters/your_adapter/`)
@@ -93,8 +94,8 @@ nautilus_trader/adapters/your_adapter/
 
 ## Adapter implementation sequence
 
-This section outlines the recommended order for implementing an adapter. The sequence follows a dependency-driven approach where each phase builds upon the previous ones.
-Adapters use a Rust-first architecture—implement the Rust core before any Python layer.
+Follow this dependency-driven order when building an adapter. Each phase
+builds on the previous one. Implement the Rust core before any Python layer.
 
 ### Phase 1: Rust core infrastructure
 
@@ -116,7 +117,7 @@ Build the low-level networking and parsing foundation.
 
 ### Phase 2: Instrument definitions
 
-Instruments are the foundation—both data and execution clients depend on them.
+Instruments are the foundation: both data and execution clients depend on them.
 
 | Step | Component                  | Description                                                                                  |
 |------|----------------------------|----------------------------------------------------------------------------------------------|
@@ -218,6 +219,24 @@ to these defaults when unset.
 Expose typed config structs in `src/config.rs` so Python callers toggle venue-specific behaviour
 (see how OKX wires demo URLs, retries, and channel flags).
 Keep defaults minimal and delegate URL selection to helpers in `common::urls`.
+
+All config structs (data and execution) must implement `Default`. This enables the
+`..Default::default()` pattern in examples and tests, keeping only the fields that differ
+from defaults visible:
+
+```rust
+let exec_config = VenueExecClientConfig {
+    trader_id,
+    account_id,
+    environment: VenueEnvironment::Testnet,
+    ..Default::default()
+};
+```
+
+Default values should use sensible production defaults: credentials as `None` (resolved
+from environment at runtime), mainnet URLs, standard timeouts. For `trader_id` and
+`account_id`, use placeholder values like `TraderId::from("TRADER-001")` and
+`AccountId::from("VENUE-001")`.
 
 ### Error taxonomy (`common/error.rs`)
 
@@ -348,9 +367,67 @@ pub fn create_instrument(
 Use this pattern when the same venue data structures are parsed in multiple places (HTTP responses,
 WebSocket updates, historical data).
 
+### Connection lifecycle (`connect`)
+
+Both data and execution clients follow a strict initialization order during `connect()` to prevent
+race conditions with reconciliation and strategy startup. The platform waits for all clients to
+signal connected before running reconciliation or starting strategies, so all initialization must
+complete within `connect()`.
+
+#### Data client
+
+1. **Fetch instruments via REST** - call `bootstrap_instruments()` or equivalent.
+2. **Cache locally** - populate the client's internal instrument map and HTTP client cache.
+3. **Emit to data engine** - send each instrument as `DataEvent::Instrument` via `data_sender`.
+   These events are queued during startup and processed before reconciliation runs.
+4. **Cache to WebSocket** - call `ws.cache_instruments()` so the handler can parse messages.
+5. **Connect WebSocket** - establish the streaming connection.
+
+```rust
+async fn connect(&mut self) -> anyhow::Result<()> {
+    let instruments = self.bootstrap_instruments().await?;
+    ws.cache_instruments(instruments);
+    ws.connect().await?;
+    ws.wait_until_active(10.0).await?;
+    // ...
+}
+```
+
+#### Execution client
+
+1. **Initialize instruments** - fetch via REST if not already cached. Cache to HTTP, WebSocket,
+   and broadcaster clients.
+2. **Connect WebSocket** - establish the private streaming connection.
+3. **Subscribe to channels** - orders, executions, positions, wallet/margin.
+4. **Start WebSocket stream handler** - begin processing incoming messages.
+5. **Fetch account state** - request account state via REST and emit via `emitter.send_account_state()`.
+6. **Await account registered** - poll the cache until the account is registered (30s timeout).
+   This ensures the portfolio can process orders during reconciliation.
+7. **Signal connected** - call `self.core.set_connected()`.
+
+```rust
+async fn connect(&mut self) -> anyhow::Result<()> {
+    self.ensure_instruments_initialized_async().await?;
+
+    self.ws_client.connect().await?;
+    self.ws_client.wait_until_active(10.0).await?;
+    // ... subscribe channels, start stream ...
+
+    self.refresh_account_state().await?;
+    self.await_account_registered(30.0).await?;
+
+    self.core.set_connected();
+    Ok(())
+}
+```
+
+The `await_account_registered` method polls `self.core.cache().account(&account_id)` at 10ms
+intervals until the account appears or the timeout expires.
+
 ## HTTP client patterns
 
-Adapters use a standardized two-layer HTTP client architecture to separate low-level API operations from high-level domain logic while enabling efficient cloning for Python bindings.
+Adapters use a two-layer HTTP client architecture: a raw client for low-level API operations and a domain
+client for high-level logic. The split also enables efficient cloning for Python bindings.
 
 ### Client structure
 
@@ -382,14 +459,23 @@ pub struct MyHttpClient {
 
 **Key points**:
 
-- **Raw client** (`MyRawHttpClient`) contains low-level HTTP methods named to match venue endpoints as closely as possible (e.g., `get_instruments`, `get_balance`, `place_order`). These methods take venue-specific query objects and return venue-specific response types.
-- **Domain client** (`MyHttpClient`) wraps the raw client in an `Arc` for efficient cloning (required for Python bindings). It provides high-level methods that accept Nautilus domain types (e.g., `InstrumentId`, `ClientOrderId`) and return domain objects. It may cache instruments or other venue metadata.
-- Use `nautilus_network::http::HttpClient` instead of `reqwest::Client` directly - this provides rate limiting, retry logic, and consistent error handling.
-- Both clients are exposed to Python, but the domain client is the primary interface for most use cases.
+- **Raw client** (`MyRawHttpClient`) contains low-level HTTP methods named to match venue endpoints
+  (e.g., `get_instruments`, `get_balance`, `place_order`). These methods take venue-specific query
+  objects and return venue-specific response types.
+- **Domain client** (`MyHttpClient`) wraps the raw client in an `Arc` for efficient cloning (required
+  for Python bindings). It provides high-level methods that accept Nautilus domain types
+  (e.g., `InstrumentId`, `ClientOrderId`) and return domain objects. It may also cache instruments
+  or other venue metadata.
+- Use `nautilus_network::http::HttpClient` instead of `reqwest::Client` directly for rate limiting,
+  retry logic, and consistent error handling.
+- Both clients are exposed to Python, but the domain client is the primary interface.
 
 ### Parser functions
 
-Parser functions convert venue-specific data structures into Nautilus domain objects. These belong in `common/parse.rs` for cross-cutting conversions (instruments, trades, bars) or `http/parse.rs` for REST-specific transformations. Each parser takes venue data plus context (account IDs, timestamps, instrument references) and returns a Nautilus domain type wrapped in `Result`.
+Parser functions convert venue-specific data structures into Nautilus domain objects. Place them in
+`common/parse.rs` for cross-cutting conversions (instruments, trades, bars) or `http/parse.rs` for
+REST-specific transformations. Each parser takes venue data plus context (account IDs, timestamps,
+instrument references) and returns a Nautilus domain type wrapped in `Result`.
 
 **Standard patterns:**
 
@@ -403,7 +489,8 @@ Place parsing helpers (`parse_price_with_precision`, `parse_timestamp`) in the s
 
 ### Method naming and organization
 
-The raw client contains low-level API methods that closely match venue endpoints, taking venue-specific query parameter types and returning venue response types. The domain client wraps the raw client and provides high-level methods that accept Nautilus domain types.
+The raw client mirrors venue endpoints with venue-specific parameter and response types. The domain
+client wraps it and exposes high-level methods that accept Nautilus domain types.
 
 **Naming conventions:**
 
@@ -461,9 +548,49 @@ Keep signing logic in a `Credential` struct under `common/credential.rs`:
 
 For WebSocket authentication, the handler constructs login messages using the same `Credential::sign()` method with a WebSocket-specific timestamp format.
 
+### Credential module structure
+
+Each adapter's `common/credential.rs` must provide two things:
+
+1. **`credential_env_vars()` free function**: returns environment variable names as a tuple.
+2. **`Credential::resolve()` method**: resolves credentials from config values or environment
+   variables using `resolve_env_var_pair` from `nautilus_core::env`.
+
+Config structs are DTOs and must not contain credential resolution logic. All resolution
+belongs in `credential.rs`.
+
+**Standard layout:**
+
+```rust
+use nautilus_core::env::resolve_env_var_pair;
+
+/// Returns the environment variable names for API credentials.
+pub fn credential_env_vars(is_testnet: bool) -> (&'static str, &'static str) {
+    if is_testnet {
+        ("{VENUE}_TESTNET_API_KEY", "{VENUE}_TESTNET_API_SECRET")
+    } else {
+        ("{VENUE}_API_KEY", "{VENUE}_API_SECRET")
+    }
+}
+
+impl Credential {
+    /// Resolves credentials from provided values or environment variables.
+    pub fn resolve(
+        api_key: Option<String>,
+        api_secret: Option<String>,
+        is_testnet: bool,
+    ) -> Option<Self> {
+        let (key_var, secret_var) = credential_env_vars(is_testnet);
+        let (k, s) = resolve_env_var_pair(api_key, api_secret, key_var, secret_var)?;
+        Some(Self::new(k, s))
+    }
+}
+```
+
 ### Environment variable conventions
 
-Adapters support loading API credentials from environment variables when not provided directly. This enables secure credential management without hardcoding secrets.
+Adapters load API credentials from environment variables when not provided directly, avoiding
+hardcoded secrets.
 
 **Naming conventions:**
 
@@ -476,60 +603,16 @@ Adapters support loading API credentials from environment variables when not pro
 Some venues require additional credentials:
 
 - OKX: `OKX_API_PASSPHRASE`
-- Coinbase INTX: `COINBASE_INTX_API_PASSPHRASE`, `COINBASE_INTX_PORTFOLIO_ID`
-
-**Implementation pattern:**
-
-Use `nautilus_core::env::get_or_env_var_opt` for optional credential resolution (returns `None` if missing) or `get_or_env_var` when credentials are required (returns error if missing):
-
-```rust
-use nautilus_core::env::get_or_env_var_opt;
-
-let (api_key_env, api_secret_env) = if testnet {
-    ("{VENUE}_TESTNET_API_KEY", "{VENUE}_TESTNET_API_SECRET")
-} else {
-    ("{VENUE}_API_KEY", "{VENUE}_API_SECRET")
-};
-
-let key = get_or_env_var_opt(api_key, api_key_env);
-let secret = get_or_env_var_opt(api_secret, api_secret_env);
-```
 
 **Key principles:**
 
+- Environment variable names must be centralized in `credential_env_vars()`, never
+  duplicated as string literals across files.
 - Environment variable resolution should happen in core Rust code, not Python bindings.
-- Use `get_or_env_var_opt` for optional credentials (public-only clients).
+- Use `get_or_env_var_opt` for optional credentials (returns `None` if missing).
 - Use `get_or_env_var` when credentials are required (returns error if missing).
-- Document supported environment variables in adapter README files.
-
-**Credential resolver helper:**
-
-Encapsulate environment-based credential resolution in a helper function when the logic involves
-multiple environments or fallback behavior:
-
-```rust
-use nautilus_core::env::get_or_env_var_opt;
-
-fn resolve_credential(
-    api_key: Option<&str>,
-    api_secret: Option<&str>,
-    is_testnet: bool,
-) -> Option<Credential> {
-    let (key_env, secret_env) = if is_testnet {
-        ("{VENUE}_TESTNET_API_KEY", "{VENUE}_TESTNET_API_SECRET")
-    } else {
-        ("{VENUE}_API_KEY", "{VENUE}_API_SECRET")
-    };
-
-    let key = get_or_env_var_opt(api_key, key_env)?;
-    let secret = get_or_env_var_opt(api_secret, secret_env)?;
-
-    Some(Credential::new(key, secret))
-}
-```
-
-This pattern returns `None` when credentials are unavailable, suitable for optional authentication.
-For clients that require credentials, use `get_or_env_var` which returns an error if missing.
+- Invalid credentials (e.g. malformed keys) must fail fast with an error, never silently
+  degrade to unauthenticated mode.
 
 ### Error handling and retry logic
 
@@ -574,7 +657,8 @@ self.send_with_retry(payload, Some(vec![OKX_RATE_LIMIT_KEY_ORDER.to_string()])).
 
 ## WebSocket client patterns
 
-WebSocket clients handle real-time streaming data and require careful management of connection state, authentication, subscriptions, and reconnection logic.
+WebSocket clients handle real-time streaming data. They manage connection state, authentication,
+subscriptions, and reconnection logic.
 
 ### Client structure
 
@@ -600,7 +684,9 @@ pub struct MyWebSocketClient {
 - **`ArcSwap`**: Enables atomic pointer replacement via `.store()` without replacing the outer Arc.
 - **Inner `Arc<AtomicU8>`**: The actual connection state from `WebSocketClient::connection_mode_atomic()`.
 
-Initialize with a placeholder atomic (`ConnectionMode::Closed`), then in `connect()` call `.store(client.connection_mode_atomic())` to atomically swap to the underlying client's state. All clones see updates instantly through lock-free `.load()` calls in `is_active()`.
+Initialize with a placeholder atomic (`ConnectionMode::Closed`), then in `connect()` call
+`.store(client.connection_mode_atomic())` to atomically swap to the real client's state.
+All clones see updates instantly through lock-free `.load()` calls in `is_active()`.
 
 The underlying `WebSocketClient` sends a `RECONNECTED` sentinel message when reconnection completes, triggering resubscription logic in the handler.
 
@@ -659,7 +745,11 @@ Authentication state is managed through events:
 - Client receives event → updates local auth state → proceeds with subscriptions.
 - `AuthTracker` may be shared via `Arc` for state queries, but handler returns events directly (no blocking).
 
-**Note**: The `Authenticated` message is consumed in the client's spawn loop for reconnection flow coordination and is not forwarded to downstream consumers (data/execution clients). Downstream consumers can query authentication state via `AuthTracker` if needed. The execution client's `Authenticated` handler only logs at debug level with no critical logic depending on this event.
+**Note**: The `Authenticated` message is consumed in the client's spawn loop for reconnection
+flow coordination and is not forwarded to downstream consumers (data/execution clients).
+Downstream consumers can query authentication state via `AuthTracker` if needed. The execution
+client's `Authenticated` handler only logs at debug level with no important logic depending
+on this event.
 
 ### Subscription management
 
@@ -779,7 +869,9 @@ WebSocket clients that cache instruments use a **dual-tier pattern** for perform
 - `HandlerCommand::InitializeInstruments(Vec<InstrumentAny>)` replays cache on connect.
 - `HandlerCommand::UpdateInstrument(InstrumentAny)` syncs individual updates post-connection.
 
-**Critical implementation detail:** When `cache_instrument()` is called after connection, it must send an `UpdateInstrument` command to the inner handler. Otherwise, instruments added dynamically (e.g., from WebSocket updates) won't be available for parsing market data.
+**Important:** When `cache_instrument()` is called after connection, it must send an
+`UpdateInstrument` command to the inner handler. Otherwise, instruments added dynamically
+(e.g., from WebSocket updates) won't be available for parsing market data.
 
 ### Handler configuration constants
 
@@ -801,11 +893,14 @@ Define two message enums for the transformation pipeline:
 
 2. **`NautilusWsMessage`**: Normalized domain messages emitted to the client (data, deltas, order events, errors, `Reconnected`, `Authenticated`). Include a `Raw(serde_json::Value)` variant for unhandled channels during development.
 
-The handler parses incoming JSON into `{Venue}WsMessage`, transforms to `NautilusWsMessage`, and sends via `out_tx`. The client receives from `out_rx` and routes to data/execution callbacks.
+The handler parses incoming JSON into `{Venue}WsMessage`, transforms it to `NautilusWsMessage`,
+and sends via `out_tx`. The client receives from `out_rx` and routes to data/execution callbacks.
 
 #### Message type naming convention
 
-Types prefixed with `Nautilus` contain only Nautilus domain types (normalized data ready for the trading system). Types prefixed with the venue name (e.g., `Binance`, `Deribit`) contain raw exchange-specific types that require further processing.
+Types prefixed with `Nautilus` contain only Nautilus domain types (normalized data ready for the
+trading system). Types prefixed with the venue name (e.g., `Binance`, `Deribit`) contain raw
+exchange-specific types that require further processing.
 
 **Top-level output enum:**
 
@@ -941,11 +1036,14 @@ let handler = FeedHandler::new(
 );
 ```
 
-Channel names reflect the data transformation stage, not the destination. Use `raw_*` only for raw WebSocket frames (`Message`), `msg_*` for venue-specific message types, and `out_*` for Nautilus domain messages.
+Channel names reflect the data transformation stage, not the destination. Use `raw_*` only for raw
+WebSocket frames (`Message`), `msg_*` for venue-specific message types, and `out_*` for Nautilus
+domain messages.
 
 ### Backpressure strategy
 
-WebSocket channels on latency-critical paths are intentionally **unbounded**. The platform is latency-first and prefers an explicit crash (OOM) over delaying or dropping data under pressure.
+WebSocket channels on latency-sensitive paths are intentionally **unbounded**. The platform
+prioritizes latency and prefers an explicit crash (OOM) over delaying or dropping data.
 
 :::note
 Do not add bounded channels, buffering limits, or backpressure unless the latency requirement changes.
@@ -994,7 +1092,9 @@ pub struct FeedHandler {
 }
 ```
 
-The handler exclusively owns `WebSocketClient` without locks. The client sends commands via `cmd_tx` (wrapped in `RwLock` to allow reconnection channel replacement) and receives events via `out_rx`. Use a `send_cmd()` helper to standardize command sending.
+The handler exclusively owns `WebSocketClient` without locks. The client sends commands via
+`cmd_tx` (wrapped in `RwLock` to allow reconnection channel replacement) and receives events
+via `out_rx`. Use a `send_cmd()` helper to standardize command sending.
 
 #### Type naming: `{Venue}Ws{TypeSuffix}`
 
@@ -1022,7 +1122,8 @@ pub struct HyperliquidWsRequest { ... }
 
 **Tokio channel qualification:**
 
-Always fully qualify tokio channel types as `tokio::sync::mpsc::` to avoid ambiguity with similarly-named types from other crates. Never import `mpsc` directly at module level.
+Always fully qualify tokio channel types as `tokio::sync::mpsc::` to avoid ambiguity with
+similarly-named types from other crates. Never import `mpsc` directly at module level.
 
 ```rust
 // Correct
@@ -1069,8 +1170,8 @@ crates/adapters/your_adapter/
 │       ├── client.rs                  # WebSocket client + unit tests
 │       └── parse.rs                   # Streaming parsers + unit tests
 ├── tests/                             # Integration tests (mock servers)
-│   ├── data.rs                        # Data client integration tests
-│   ├── execution.rs                   # Execution client integration tests
+│   ├── data_client.rs                 # Data client integration tests
+│   ├── exec_client.rs                 # Execution client integration tests
 │   ├── http.rs                        # HTTP client integration tests
 │   └── websocket.rs                   # WebSocket client integration tests
 └── test_data/                         # Canonical venue payloads used by the suites
@@ -1082,16 +1183,16 @@ crates/adapters/your_adapter/
 
 | File                 | Purpose                                                                                                                   |
 |----------------------|---------------------------------------------------------------------------------------------------------------------------|
-| `tests/data.rs`      | Integration tests for the data client—validates data subscriptions, historical data requests, and market data parsing.    |
-| `tests/execution.rs` | Integration tests for the execution client—validates order submission, modification, cancellation, and execution reports. |
-| `tests/http.rs`      | Low-level HTTP client tests—validates request signing, error handling, and response parsing against mock Axum servers.    |
-| `tests/websocket.rs` | WebSocket client tests—validates connection lifecycle, authentication, subscriptions, and message routing.                |
+| `tests/data_client.rs` | Integration tests for the data client. Validates data subscriptions, historical data requests, and market data parsing.    |
+| `tests/exec_client.rs` | Integration tests for the execution client. Validates order submission, modification, cancellation, and execution reports. |
+| `tests/http.rs`      | Low-level HTTP client tests. Validates request signing, error handling, and response parsing against mock Axum servers.    |
+| `tests/websocket.rs` | WebSocket client tests. Validates connection lifecycle, authentication, subscriptions, and message routing.                |
 
 **Guidelines:**
 
 - Place unit tests next to the module they exercise (`#[cfg(test)]` blocks). Use `src/common/testing.rs` (or an equivalent helper module) for shared fixtures so production files stay tidy.
 - Keep Axum-based integration suites under `crates/adapters/<adapter>/tests/`, mirroring the public APIs (HTTP client, WebSocket client, data client, execution client).
-- Data and execution client tests (`data.rs`, `execution.rs`) should focus on higher-level behavior: subscription workflows, order lifecycle, and domain model transformations. HTTP and WebSocket tests (`http.rs`, `websocket.rs`) focus on transport-level concerns.
+- Data and execution client tests (`data_client.rs`, `exec_client.rs`) should focus on higher-level behavior: subscription workflows, order lifecycle, and domain model transformations. HTTP and WebSocket tests (`http.rs`, `websocket.rs`) focus on transport-level concerns.
 - Store upstream payload samples (snapshots, REST replies) under `test_data/` and reference them from both unit and integration tests. Name test data files consistently: `http_get_{endpoint_name}.json` for REST responses, `ws_{message_type}.json` for WebSocket messages. Include complete venue response envelopes (status codes, timestamps, result wrappers) rather than just the data payload. Provide multiple realistic examples in each file - for instance, position data should include long, short, and flat positions to exercise all parser branches.
 - **Test data sourcing**: Test data must be obtained from either official API documentation examples or directly from the live API via network calls. Never fabricate or generate test data manually, as this risks missing edge cases (e.g., negative precision values, scientific notation, unexpected field types) that only appear in real venue responses.
 
@@ -1127,11 +1228,12 @@ Integration tests belong in the `tests/` directory and exercise the public API a
 - Execution client order submission, modification, and cancellation flows.
 - Error handling and retry behavior with simulated failures.
 
-At a minimum, review existing adapter test suites for reference patterns and ensure every adapter proves the same core behaviours.
+At a minimum, review existing adapter test suites for reference patterns and verify every adapter
+proves the same core behaviours.
 
 ##### HTTP client integration coverage
 
-- **Happy paths** – fetch a representative public resource (e.g., instruments or mark price) and ensure the
+- **Happy paths** – fetch a representative public resource (e.g., instruments or mark price) and verify the
   response is converted into Nautilus domain models.
 - **Credential guard** – call a private endpoint without credentials and assert a structured error; repeat with
   credentials to prove success.
@@ -1148,7 +1250,7 @@ At a minimum, review existing adapter test suites for reference patterns and ens
 - **Ping/Pong** – prove both text-based and control-frame pings trigger immediate pong responses.
 - **Subscription lifecycle** – assert subscription requests/acks are emitted for public and private channels, and that
   unsubscribe calls remove entries from the cached subscription sets.
-- **Reconnect behaviour** – simulate a disconnect and ensure the client re-authenticates, restores public channels,
+- **Reconnect behaviour** – simulate a disconnect and verify the client re-authenticates, restores public channels,
   and skips private channels that were explicitly unsubscribed pre-disconnect.
 - **Message routing** – feed representative data/ack/error payloads through the socket and assert they arrive on the
   public stream as the correct `NautilusWsMessage` variant.
@@ -1157,8 +1259,10 @@ At a minimum, review existing adapter test suites for reference patterns and ens
 
 **CI robustness:**
 
-- Never use bare `tokio::time::sleep()` with arbitrary durations—tests become flaky under CI load and slower than necessary.
-- Use the `wait_until_async` test helper to poll for conditions with timeout. This makes tests both faster (returns immediately when condition is met) and more robust (explicit timeout instead of hoping a sleep duration is long enough).
+- Never use bare `tokio::time::sleep()` with arbitrary durations. Tests become flaky under CI load and slower than necessary.
+- Use the `wait_until_async` test helper to poll for conditions with timeout. Tests return
+  immediately when the condition is met and fail deterministically on timeout rather than
+  relying on arbitrary sleep durations.
 - Prefer event-driven assertions with shared state (for example, collect `subscription_events`, track pending/confirmed topics, wait for `connection_count` transitions).
 - Use adapter-specific helpers to gate on explicit signals such as "auth confirmed" or "reconnection finished" so suites remain deterministic under load.
 
@@ -1222,10 +1326,10 @@ tests/integration_tests/adapters/your_adapter/
 
 | File                | Purpose                                                                                                            |
 |---------------------|--------------------------------------------------------------------------------------------------------------------|
-| `test_data.py`      | Tests for `LiveDataClient` and `LiveMarketDataClient`—validates subscriptions, data parsing, and message handling. |
-| `test_execution.py` | Tests for `LiveExecutionClient`—validates order submission, modification, cancellation, and execution reports.     |
-| `test_providers.py` | Tests for `InstrumentProvider`—validates instrument loading, filtering, and caching behavior.                      |
-| `test_factories.py` | Tests for factory functions—validates client instantiation and configuration wiring.                               |
+| `test_data.py`      | Tests for `LiveDataClient` and `LiveMarketDataClient`. Validates subscriptions, data parsing, and message handling. |
+| `test_execution.py` | Tests for `LiveExecutionClient`. Validates order submission, modification, cancellation, and execution reports.     |
+| `test_providers.py` | Tests for `InstrumentProvider`. Validates instrument loading, filtering, and caching behavior.                      |
+| `test_factories.py` | Tests for factory functions. Validates client instantiation and configuration wiring.                               |
 
 **Guidelines:**
 
@@ -1237,8 +1341,8 @@ tests/integration_tests/adapters/your_adapter/
 
 ## Documentation
 
-All adapter documentation—module-level docs, doc comments, and inline comments—should follow the [Documentation Style Guide](docs.md).
-Consistent documentation helps maintainers and users understand adapter behavior without reading implementation details.
+All adapter documentation (module-level docs, doc comments, and inline comments) should follow the
+[Documentation Style Guide](docs.md).
 
 ### Rust documentation requirements
 
@@ -1246,9 +1350,9 @@ Every Rust module, struct, and public method must have documentation comments.
 Use third-person declarative voice (e.g., "Returns the account ID" not "Return the account ID").
 
 - **Modules**: Use `//!` doc comments at the top of each file (after the license header) to describe the module's purpose.
-- **Structs**: Use `///` doc comments above struct definitions. Keep descriptions concise—one sentence is often sufficient.
+- **Structs**: Use `///` doc comments above struct definitions. Keep descriptions concise; one sentence is often sufficient.
 - **Public methods**: Every `pub fn` and `pub async fn` must have a `///` doc comment describing what the method does.
-  Do not document individual parameters in a separate `# Arguments` section—the type signatures and names should be self-explanatory.
+  Do not document individual parameters in a separate `# Arguments` section. The type signatures and names should be self-explanatory.
   Parameters may be mentioned in the description when behavior is complex or non-obvious.
 
 **What NOT to document**:
@@ -1256,13 +1360,13 @@ Use third-person declarative voice (e.g., "Returns the account ID" not "Return t
 - Private methods and fields (unless complex logic warrants it).
 - Individual parameters/arguments (use descriptive names instead).
 - Implementation details that are obvious from the code.
-- Files in the `python/` module (PyO3 bindings)—documentation conventions are TBD (*may* use numpydoc specification).
+- Files in the `python/` module (PyO3 bindings). Documentation conventions are TBD (*may* use numpydoc specification).
 
 ---
 
 ## Python adapter layer
 
-Below is a step-by-step guide to building an adapter for a new data provider using the provided template.
+Step-by-step guide to building the Python layer of an adapter using the provided template.
 
 ### Method ordering convention
 
@@ -1273,14 +1377,12 @@ When implementing adapter classes, group methods by category in this order:
 3. **Unsubscribe handlers**: `_unsubscribe`, `_unsubscribe_*`
 4. **Request handlers**: `_request`, `_request_*`
 
-This convention improves readability by keeping related functionality together rather than
-interleaving subscribe/unsubscribe pairs.
+This keeps related functionality together rather than interleaving subscribe/unsubscribe pairs.
 
 ### InstrumentProvider
 
-The `InstrumentProvider` supplies instrument definitions available on the venue. This
-includes loading all available instruments, specific instruments by ID, and applying filters to the
-instrument list.
+The `InstrumentProvider` loads instrument definitions from the venue: all instruments, specific
+instruments by ID, or a filtered subset.
 
 ```python
 from nautilus_trader.common.providers import InstrumentProvider
@@ -1308,9 +1410,8 @@ class TemplateInstrumentProvider(InstrumentProvider):
 
 ### DataClient
 
-The `LiveDataClient` handles the subscription and management of data feeds that are not specifically
-related to market data. This might include news feeds, custom data streams, or other data sources
-that enhance trading strategies but do not directly represent market activity.
+The `LiveDataClient` handles data feeds that are not market data: news feeds, custom data streams,
+or other non-market sources.
 
 ```python
 from nautilus_trader.data.messages import RequestData
@@ -1349,9 +1450,8 @@ class TemplateLiveDataClient(LiveDataClient):
 
 ### MarketDataClient
 
-The `MarketDataClient` handles market-specific data such as order books, top-of-book quotes and trades,
-and instrument status updates. It focuses on providing historical and real-time market data that is essential for
-trading operations.
+The `MarketDataClient` handles market-specific data: order books, top-of-book quotes and trades,
+instrument status updates, and historical data requests.
 
 ```python
 from nautilus_trader.data.messages import RequestBars
@@ -1602,15 +1702,14 @@ last_add_delta = OrderBookDelta(
 ```
 
 :::warning
-A missing `F_LAST` is a silent bug — no error is raised, but subscribers
+A missing `F_LAST` is a silent bug: no error is raised, but subscribers
 never receive the data when buffering is enabled.
 :::
 
 ### ExecutionClient
 
-The `ExecutionClient` is responsible for order management, including submission, modification, and
-cancellation of orders. It is a crucial component of the adapter that interacts with the venue
-trading system to manage and execute trades.
+The `ExecutionClient` manages order submission, modification, and cancellation against the venue
+trading system.
 
 ```python
 from nautilus_trader.execution.messages import BatchCancelOrders
@@ -1706,9 +1805,7 @@ class TemplateLiveExecutionClient(LiveExecutionClient):
 
 ### Configuration
 
-The configuration file defines settings specific to the adapter, such as API keys and connection
-details. These settings are essential for initializing and managing the adapter’s connection to the
-data provider.
+Configuration classes hold adapter-specific settings like API keys and connection details.
 
 ```python
 from nautilus_trader.config import LiveDataClientConfig
@@ -1739,11 +1836,12 @@ class TemplateExecClientConfig(LiveExecClientConfig):
 
 ## Common test scenarios
 
-Exercise adapters across every venue behaviour they claim to support. Incorporate these scenarios into the Rust and Python suites.
+Exercise adapters across every venue behaviour they claim to support. Incorporate these scenarios
+into the Rust and Python suites.
 
 ### Product coverage
 
-Ensure each supported product family is tested.
+Test each supported product family.
 
 - Spot instruments
 - Derivatives (perpetuals, futures, swaps)
@@ -1757,5 +1855,18 @@ Ensure each supported product family is tested.
 
 ### State management
 
-- Start sessions with existing open orders to ensure the adapter reconciles state on connect before issuing new commands.
+- Start sessions with existing open orders to verify the adapter reconciles state on connect before
+  issuing new commands.
 - Seed preloaded positions and confirm position snapshots, valuation, and PnL agree with the venue prior to trading.
+
+---
+
+## Data testing spec
+
+See the full [Data Testing Spec](spec_data_testing.md) for the `DataTester` test matrix.
+
+---
+
+## Execution testing spec
+
+See the full [Execution Testing Spec](spec_exec_testing.md) for the `ExecTester` test matrix.

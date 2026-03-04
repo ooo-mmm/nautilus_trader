@@ -31,10 +31,11 @@ use nautilus_common::{
         data::{
             BarsResponse, InstrumentResponse, InstrumentsResponse, RequestBars, RequestInstrument,
             RequestInstruments, RequestTrades, SubscribeBars, SubscribeBookDeltas,
-            SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument, SubscribeInstruments,
-            SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades, TradesResponse, UnsubscribeBars,
-            UnsubscribeBookDeltas, UnsubscribeFundingRates, UnsubscribeIndexPrices,
-            UnsubscribeInstrument, UnsubscribeInstruments, UnsubscribeMarkPrices,
+            SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
+            SubscribeInstrumentStatus, SubscribeInstruments, SubscribeMarkPrices, SubscribeQuotes,
+            SubscribeTrades, TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas,
+            UnsubscribeFundingRates, UnsubscribeIndexPrices, UnsubscribeInstrument,
+            UnsubscribeInstrumentStatus, UnsubscribeInstruments, UnsubscribeMarkPrices,
             UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
@@ -45,8 +46,8 @@ use nautilus_core::{
 };
 use nautilus_model::{
     data::{
-        Bar, BarSpecification, BarType, BookOrder, Data as NautilusData, OrderBookDelta,
-        OrderBookDeltas, OrderBookDeltas_API, QuoteTick,
+        Bar, BarSpecification, BarType, BookOrder, Data as NautilusData, InstrumentStatus,
+        OrderBookDelta, OrderBookDeltas, OrderBookDeltas_API, QuoteTick,
     },
     enums::{BookAction, BookType, OrderSide, RecordFlag},
     identifiers::{ClientId, InstrumentId, Venue},
@@ -69,6 +70,7 @@ use crate::{
 
 /// Groups WebSocket message handling dependencies.
 struct WsMessageContext {
+    clock: &'static AtomicTime,
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
     instrument_cache: Arc<InstrumentCache>,
     order_books: Arc<DashMap<InstrumentId, OrderBook>>,
@@ -83,6 +85,8 @@ struct WsMessageContext {
     active_mark_price_subs: Arc<DashSet<InstrumentId>>,
     active_index_price_subs: Arc<DashSet<InstrumentId>>,
     active_funding_rate_subs: Arc<DashSet<InstrumentId>>,
+    active_instrument_status_subs: Arc<DashSet<InstrumentId>>,
+    last_instrument_statuses: Arc<DashMap<InstrumentId, InstrumentStatus>>,
 }
 
 /// dYdX data client for live market data streaming and historical data requests.
@@ -140,6 +144,10 @@ pub struct DydxDataClient {
     active_index_price_subs: Arc<DashSet<InstrumentId>>,
     /// Active funding rate subscriptions (instruments expecting `FundingRateUpdate` events).
     active_funding_rate_subs: Arc<DashSet<InstrumentId>>,
+    /// Active instrument status subscriptions (instruments expecting `InstrumentStatus` events).
+    active_instrument_status_subs: Arc<DashSet<InstrumentId>>,
+    /// Last known instrument status per instrument (for replay on late subscription).
+    last_instrument_statuses: Arc<DashMap<InstrumentId, InstrumentStatus>>,
 }
 
 impl DydxDataClient {
@@ -162,7 +170,6 @@ impl DydxDataClient {
         let clock = get_atomic_clock_realtime();
         let data_sender = get_data_event_sender();
 
-        // Share the instrument cache from HTTP client
         let instrument_cache = Arc::clone(http_client.instrument_cache());
 
         Ok(Self {
@@ -187,6 +194,8 @@ impl DydxDataClient {
             active_mark_price_subs: Arc::new(DashSet::new()),
             active_index_price_subs: Arc::new(DashSet::new()),
             active_funding_rate_subs: Arc::new(DashSet::new()),
+            active_instrument_status_subs: Arc::new(DashSet::new()),
+            last_instrument_statuses: Arc::new(DashMap::new()),
         })
     }
 
@@ -208,9 +217,6 @@ impl DydxDataClient {
         self.is_connected.load(Ordering::Relaxed)
     }
 
-    /// Spawns an async WebSocket task with error handling.
-    ///
-    /// This helper ensures consistent error logging across all subscription methods.
     fn spawn_ws<F>(&self, fut: F, context: &'static str)
     where
         F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
@@ -222,7 +228,6 @@ impl DydxDataClient {
         });
     }
 
-    /// Spawns a stream handler to dispatch WebSocket messages to the data engine.
     fn spawn_ws_stream_handler(
         &mut self,
         stream: impl Stream<Item = NautilusWsMessage> + Send + 'static,
@@ -257,33 +262,13 @@ impl DydxDataClient {
         self.tasks.push(handle);
     }
 
-    /// Awaits all background tasks with a timeout for graceful shutdown.
-    ///
-    /// This ensures tasks are given a chance to complete cleanly after cancellation
-    /// rather than being abruptly dropped. Tasks that don't complete within the
-    /// timeout are allowed to continue running (will be cleaned up by tokio).
     async fn await_tasks_with_timeout(&mut self, timeout: Duration) {
         for handle in self.tasks.drain(..) {
             let _ = tokio::time::timeout(timeout, handle).await;
         }
     }
 
-    /// Bootstrap instruments from the dYdX Indexer API.
-    ///
-    /// This method:
-    /// 1. Fetches all available instruments from the REST API
-    /// 2. Caches them in the HTTP client
-    /// 3. Caches them in the WebSocket client (if present)
-    /// 4. Populates the local instruments cache
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The HTTP request fails.
-    /// - Instrument parsing fails.
-    ///
     async fn bootstrap_instruments(&mut self) -> anyhow::Result<Vec<InstrumentAny>> {
-        // Fetch instruments via HTTP - this populates the shared InstrumentCache
         self.http_client
             .fetch_and_cache_instruments()
             .await
@@ -298,10 +283,8 @@ impl DydxDataClient {
 
         log::info!("Loaded {} instruments into shared cache", instruments.len());
 
-        // Cache in WebSocket client for handler lookups
         self.ws_client.cache_instruments(instruments.clone());
 
-        // Publish all instruments to the data engine so they're available in the shared Cache
         for instrument in &instruments {
             if let Err(e) = self
                 .data_sender
@@ -365,10 +348,8 @@ impl DataClient for DydxDataClient {
 
         log::info!("Connecting");
 
-        // Bootstrap instruments first
         self.bootstrap_instruments().await?;
 
-        // Connect WebSocket client and subscribe to market updates
         self.ws_client
             .connect()
             .await
@@ -379,8 +360,8 @@ impl DataClient for DydxDataClient {
             .await
             .context("failed to subscribe to markets channel")?;
 
-        // Start message processing task (handler already converts to NautilusWsMessage)
         let ctx = WsMessageContext {
+            clock: self.clock,
             data_sender: self.data_sender.clone(),
             instrument_cache: self.instrument_cache.clone(),
             order_books: self.order_books.clone(),
@@ -395,6 +376,8 @@ impl DataClient for DydxDataClient {
             active_mark_price_subs: self.active_mark_price_subs.clone(),
             active_index_price_subs: self.active_index_price_subs.clone(),
             active_funding_rate_subs: self.active_funding_rate_subs.clone(),
+            active_instrument_status_subs: self.active_instrument_status_subs.clone(),
+            last_instrument_statuses: self.last_instrument_statuses.clone(),
         };
 
         let stream = self.ws_client.stream();
@@ -413,10 +396,8 @@ impl DataClient for DydxDataClient {
 
         log::info!("Disconnecting");
 
-        // Cancel all tasks
         self.cancellation_token.cancel();
 
-        // Await tasks with timeout for graceful shutdown
         self.await_tasks_with_timeout(Duration::from_secs(5)).await;
 
         self.ws_client
@@ -424,6 +405,7 @@ impl DataClient for DydxDataClient {
             .await
             .context("failed to disconnect dYdX websocket")?;
 
+        self.last_instrument_statuses.clear();
         self.is_connected.store(false, Ordering::Relaxed);
         log::info!("Disconnected dYdX data client");
 
@@ -438,31 +420,12 @@ impl DataClient for DydxDataClient {
         !self.is_connected()
     }
 
-    fn unsubscribe_instruments(&mut self, _cmd: &UnsubscribeInstruments) -> anyhow::Result<()> {
-        // dYdX uses a global markets channel which streams instruments implicitly.
-        // There is no dedicated instruments subscription, so this is a no-op to
-        // mirror the behaviour of `subscribe_instruments`.
-        log::debug!("unsubscribe_instruments: dYdX markets channel is global; no-op");
-        Ok(())
-    }
-
-    fn unsubscribe_instrument(&mut self, _cmd: &UnsubscribeInstrument) -> anyhow::Result<()> {
-        // dYdX does not support per-instrument instrument feed subscriptions.
-        // The markets channel always streams all instruments, so this is a no-op.
-        log::debug!("unsubscribe_instrument: dYdX markets channel is global; no-op");
-        Ok(())
-    }
-
     fn subscribe_instruments(&mut self, _cmd: &SubscribeInstruments) -> anyhow::Result<()> {
-        // dYdX markets channel auto-subscribes to all instruments
-        // No explicit subscription needed - already handled in connect()
         log::debug!("subscribe_instruments: dYdX auto-subscribes via markets channel");
         Ok(())
     }
 
     fn subscribe_instrument(&mut self, cmd: &SubscribeInstrument) -> anyhow::Result<()> {
-        // dYdX instruments are already cached from HTTP during connect()
-        // Look up and send the requested instrument to the data engine
         if let Some(instrument) = self.instrument_cache.get(&cmd.instrument_id) {
             log::debug!("Sending cached instrument for {}", cmd.instrument_id);
             if let Err(e) = self.data_sender.send(DataEvent::Instrument(instrument)) {
@@ -478,64 +441,6 @@ impl DataClient for DydxDataClient {
         Ok(())
     }
 
-    fn subscribe_mark_prices(&mut self, cmd: &SubscribeMarkPrices) -> anyhow::Result<()> {
-        let instrument_id = cmd.instrument_id;
-        self.active_mark_price_subs.insert(instrument_id);
-        log::info!("Subscribed to mark prices for {instrument_id} (via v4_markets channel)");
-        Ok(())
-    }
-
-    fn subscribe_index_prices(&mut self, cmd: &SubscribeIndexPrices) -> anyhow::Result<()> {
-        let instrument_id = cmd.instrument_id;
-        self.active_index_price_subs.insert(instrument_id);
-        log::info!("Subscribed to index prices for {instrument_id} (via v4_markets channel)");
-        Ok(())
-    }
-
-    fn subscribe_funding_rates(&mut self, cmd: &SubscribeFundingRates) -> anyhow::Result<()> {
-        let instrument_id = cmd.instrument_id;
-        self.active_funding_rate_subs.insert(instrument_id);
-        log::info!("Subscribed to funding rates for {instrument_id} (via v4_markets channel)");
-        Ok(())
-    }
-
-    fn unsubscribe_mark_prices(&mut self, cmd: &UnsubscribeMarkPrices) -> anyhow::Result<()> {
-        self.active_mark_price_subs.remove(&cmd.instrument_id);
-        log::info!("Unsubscribed from mark prices for {}", cmd.instrument_id);
-        Ok(())
-    }
-
-    fn unsubscribe_index_prices(&mut self, cmd: &UnsubscribeIndexPrices) -> anyhow::Result<()> {
-        self.active_index_price_subs.remove(&cmd.instrument_id);
-        log::info!("Unsubscribed from index prices for {}", cmd.instrument_id);
-        Ok(())
-    }
-
-    fn unsubscribe_funding_rates(&mut self, cmd: &UnsubscribeFundingRates) -> anyhow::Result<()> {
-        self.active_funding_rate_subs.remove(&cmd.instrument_id);
-        log::info!("Unsubscribed from funding rates for {}", cmd.instrument_id);
-        Ok(())
-    }
-
-    fn subscribe_trades(&mut self, cmd: &SubscribeTrades) -> anyhow::Result<()> {
-        let ws = self.ws_client.clone();
-        let instrument_id = cmd.instrument_id;
-
-        // Track active subscription for reconnection recovery
-        self.active_trade_subs.insert(instrument_id, ());
-
-        self.spawn_ws(
-            async move {
-                ws.subscribe_trades(instrument_id)
-                    .await
-                    .context("trade subscription")
-            },
-            "dYdX trade subscription",
-        );
-
-        Ok(())
-    }
-
     fn subscribe_book_deltas(&mut self, cmd: &SubscribeBookDeltas) -> anyhow::Result<()> {
         if cmd.book_type != BookType::L2_MBP {
             anyhow::bail!(
@@ -544,10 +449,7 @@ impl DataClient for DydxDataClient {
             );
         }
 
-        // Ensure local order book exists for this instrument.
         self.ensure_order_book(cmd.instrument_id, BookType::L2_MBP);
-
-        // Track active delta subscription
         self.active_delta_subs.insert(cmd.instrument_id);
 
         let ws = self.ws_client.clone();
@@ -566,8 +468,6 @@ impl DataClient for DydxDataClient {
     }
 
     fn subscribe_quotes(&mut self, cmd: &SubscribeQuotes) -> anyhow::Result<()> {
-        // dYdX doesn't have a dedicated quotes channel —
-        // quotes are synthesized from order book deltas (top-of-book).
         log::debug!(
             "Subscribe_quotes for {}: subscribing to orderbook WS channel for quote synthesis",
             cmd.instrument_id
@@ -590,20 +490,48 @@ impl DataClient for DydxDataClient {
         Ok(())
     }
 
+    fn subscribe_trades(&mut self, cmd: &SubscribeTrades) -> anyhow::Result<()> {
+        let ws = self.ws_client.clone();
+        let instrument_id = cmd.instrument_id;
+
+        self.active_trade_subs.insert(instrument_id, ());
+
+        self.spawn_ws(
+            async move {
+                ws.subscribe_trades(instrument_id)
+                    .await
+                    .context("trade subscription")
+            },
+            "dYdX trade subscription",
+        );
+
+        Ok(())
+    }
+
+    fn subscribe_mark_prices(&mut self, cmd: &SubscribeMarkPrices) -> anyhow::Result<()> {
+        let instrument_id = cmd.instrument_id;
+        self.active_mark_price_subs.insert(instrument_id);
+        log::info!("Subscribed to mark prices for {instrument_id} (via v4_markets channel)");
+        Ok(())
+    }
+
+    fn subscribe_index_prices(&mut self, cmd: &SubscribeIndexPrices) -> anyhow::Result<()> {
+        let instrument_id = cmd.instrument_id;
+        self.active_index_price_subs.insert(instrument_id);
+        log::info!("Subscribed to index prices for {instrument_id} (via v4_markets channel)");
+        Ok(())
+    }
+
     fn subscribe_bars(&mut self, cmd: &SubscribeBars) -> anyhow::Result<()> {
         let ws = self.ws_client.clone();
         let instrument_id = cmd.bar_type.instrument_id();
         let spec = cmd.bar_type.spec();
 
-        // Use centralized bar spec mapping
         let resolution = Self::map_bar_spec_to_resolution(&spec)?;
-
-        // Track active subscription for reconnection recovery
         let bar_type = cmd.bar_type;
         self.active_bar_subs
             .insert((instrument_id, resolution.to_string()), bar_type);
 
-        // Register topic → BarType mapping for validation and lookup
         let ticker = extract_raw_symbol(instrument_id.symbol.as_str());
         let topic = format!("{ticker}/{resolution}");
         self.bar_type_mappings.insert(topic.clone(), bar_type);
@@ -629,27 +557,42 @@ impl DataClient for DydxDataClient {
         Ok(())
     }
 
-    fn unsubscribe_trades(&mut self, cmd: &UnsubscribeTrades) -> anyhow::Result<()> {
-        // Remove from active subscription tracking
-        self.active_trade_subs.remove(&cmd.instrument_id);
-
-        let ws = self.ws_client.clone();
+    fn subscribe_funding_rates(&mut self, cmd: &SubscribeFundingRates) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
+        self.active_funding_rate_subs.insert(instrument_id);
+        log::info!("Subscribed to funding rates for {instrument_id} (via v4_markets channel)");
+        Ok(())
+    }
 
-        self.spawn_ws(
-            async move {
-                ws.unsubscribe_trades(instrument_id)
-                    .await
-                    .context("trade unsubscription")
-            },
-            "dYdX trade unsubscription",
-        );
+    fn subscribe_instrument_status(
+        &mut self,
+        cmd: &SubscribeInstrumentStatus,
+    ) -> anyhow::Result<()> {
+        let instrument_id = cmd.instrument_id;
+        self.active_instrument_status_subs.insert(instrument_id);
+        log::info!("Subscribed to instrument status for {instrument_id} (via v4_markets channel)");
+
+        // Replay last known status (initial snapshot arrives before subscription)
+        if let Some(status) = self.last_instrument_statuses.get(&instrument_id)
+            && let Err(e) = self.data_sender.send(DataEvent::InstrumentStatus(*status))
+        {
+            log::error!("Failed to replay instrument status for {instrument_id}: {e}");
+        }
 
         Ok(())
     }
 
+    fn unsubscribe_instruments(&mut self, _cmd: &UnsubscribeInstruments) -> anyhow::Result<()> {
+        log::debug!("unsubscribe_instruments: dYdX markets channel is global; no-op");
+        Ok(())
+    }
+
+    fn unsubscribe_instrument(&mut self, _cmd: &UnsubscribeInstrument) -> anyhow::Result<()> {
+        log::debug!("unsubscribe_instrument: dYdX markets channel is global; no-op");
+        Ok(())
+    }
+
     fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> anyhow::Result<()> {
-        // Remove from active delta subscription tracking
         self.active_delta_subs.remove(&cmd.instrument_id);
 
         let ws = self.ws_client.clone();
@@ -673,11 +616,8 @@ impl DataClient for DydxDataClient {
             cmd.instrument_id
         );
 
-        // Remove from active quote subscription tracking
         self.active_quote_subs.remove(&cmd.instrument_id);
 
-        // Unsubscribe from WS orderbook channel (refcount handles dedup —
-        // only sends WS unsubscribe when no delta sub remains either)
         let ws = self.ws_client.clone();
         let instrument_id = cmd.instrument_id;
 
@@ -693,6 +633,36 @@ impl DataClient for DydxDataClient {
         Ok(())
     }
 
+    fn unsubscribe_trades(&mut self, cmd: &UnsubscribeTrades) -> anyhow::Result<()> {
+        self.active_trade_subs.remove(&cmd.instrument_id);
+
+        let ws = self.ws_client.clone();
+        let instrument_id = cmd.instrument_id;
+
+        self.spawn_ws(
+            async move {
+                ws.unsubscribe_trades(instrument_id)
+                    .await
+                    .context("trade unsubscription")
+            },
+            "dYdX trade unsubscription",
+        );
+
+        Ok(())
+    }
+
+    fn unsubscribe_mark_prices(&mut self, cmd: &UnsubscribeMarkPrices) -> anyhow::Result<()> {
+        self.active_mark_price_subs.remove(&cmd.instrument_id);
+        log::info!("Unsubscribed from mark prices for {}", cmd.instrument_id);
+        Ok(())
+    }
+
+    fn unsubscribe_index_prices(&mut self, cmd: &UnsubscribeIndexPrices) -> anyhow::Result<()> {
+        self.active_index_price_subs.remove(&cmd.instrument_id);
+        log::info!("Unsubscribed from index prices for {}", cmd.instrument_id);
+        Ok(())
+    }
+
     fn unsubscribe_bars(&mut self, cmd: &UnsubscribeBars) -> anyhow::Result<()> {
         let ws = self.ws_client.clone();
         let instrument_id = cmd.bar_type.instrument_id();
@@ -700,11 +670,9 @@ impl DataClient for DydxDataClient {
 
         let resolution = Self::map_bar_spec_to_resolution(&spec)?;
 
-        // Remove from active subscription tracking
         self.active_bar_subs
             .remove(&(instrument_id, resolution.to_string()));
 
-        // Unregister bar type from handler and local mappings
         let ticker = extract_raw_symbol(instrument_id.symbol.as_str());
         let topic = format!("{ticker}/{resolution}");
         self.bar_type_mappings.remove(&topic);
@@ -725,6 +693,25 @@ impl DataClient for DydxDataClient {
         Ok(())
     }
 
+    fn unsubscribe_funding_rates(&mut self, cmd: &UnsubscribeFundingRates) -> anyhow::Result<()> {
+        self.active_funding_rate_subs.remove(&cmd.instrument_id);
+        log::info!("Unsubscribed from funding rates for {}", cmd.instrument_id);
+        Ok(())
+    }
+
+    fn unsubscribe_instrument_status(
+        &mut self,
+        cmd: &UnsubscribeInstrumentStatus,
+    ) -> anyhow::Result<()> {
+        self.active_instrument_status_subs
+            .remove(&cmd.instrument_id);
+        log::info!(
+            "Unsubscribed from instrument status for {}",
+            cmd.instrument_id
+        );
+        Ok(())
+    }
+
     fn request_instrument(&self, request: RequestInstrument) -> anyhow::Result<()> {
         if request.start.is_some() {
             log::warn!(
@@ -732,6 +719,7 @@ impl DataClient for DydxDataClient {
                 request.instrument_id
             );
         }
+
         if request.end.is_some() {
             log::warn!(
                 "Requesting instrument {} with specified `end` which has no effect",
@@ -753,20 +741,16 @@ impl DataClient for DydxDataClient {
         let end_nanos = datetime_to_unix_nanos(end);
 
         get_runtime().spawn(async move {
-            // First try to get from cache
             let instrument = if let Some(cached) = instrument_cache.get(&instrument_id) {
                 log::debug!("Found instrument {instrument_id} in cache");
                 Some(cached)
             } else {
-                // Not in cache, fetch from API
                 log::debug!("Instrument {instrument_id} not in cache, fetching from API");
                 match http.request_instruments(None, None, None).await {
                     Ok(instruments) => {
-                        // Cache all fetched instruments
                         for inst in &instruments {
                             instrument_cache.insert_instrument_only(inst.clone());
                         }
-                        // Find the requested instrument
                         instruments.into_iter().find(|i| i.id() == instrument_id)
                     }
                     Err(e) => {
@@ -818,7 +802,6 @@ impl DataClient for DydxDataClient {
                 Ok(instruments) => {
                     log::info!("Fetched {} instruments from dYdX", instruments.len());
 
-                    // Cache all instruments
                     for instrument in &instruments {
                         instrument_cache.insert_instrument_only(instrument.clone());
                     }
@@ -841,7 +824,6 @@ impl DataClient for DydxDataClient {
                 Err(e) => {
                     log::error!("Failed to fetch instruments from dYdX: {e:?}");
 
-                    // Send empty response on error
                     let response = DataResponse::Instruments(InstrumentsResponse::new(
                         request_id,
                         client_id,
@@ -894,6 +876,7 @@ impl DataClient for DydxDataClient {
                         clock.get_time_ns(),
                         params,
                     ));
+
                     if let Err(e) = sender.send(DataEvent::Response(response)) {
                         log::error!("Failed to send trades response: {e}");
                     }
@@ -936,6 +919,7 @@ impl DataClient for DydxDataClient {
                         clock.get_time_ns(),
                         params,
                     ));
+
                     if let Err(e) = sender.send(DataEvent::Response(response)) {
                         log::error!("Failed to send bars response: {e}");
                     }
@@ -1000,7 +984,12 @@ impl DydxDataClient {
     fn handle_ws_message(message: NautilusWsMessage, ctx: &WsMessageContext) {
         match message {
             NautilusWsMessage::Data(payloads) => {
-                Self::handle_data_message(payloads, &ctx.data_sender, &ctx.incomplete_bars);
+                Self::handle_data_message(
+                    payloads,
+                    &ctx.data_sender,
+                    &ctx.incomplete_bars,
+                    ctx.clock,
+                );
             }
             NautilusWsMessage::Deltas(deltas) => {
                 Self::handle_deltas_message(
@@ -1042,6 +1031,18 @@ impl DydxDataClient {
                     && let Err(e) = ctx.data_sender.send(DataEvent::FundingRate(funding_rate))
                 {
                     log::error!("Failed to emit funding rate: {e}");
+                }
+            }
+            NautilusWsMessage::InstrumentStatus(status) => {
+                ctx.last_instrument_statuses
+                    .insert(status.instrument_id, status);
+
+                if ctx
+                    .active_instrument_status_subs
+                    .contains(&status.instrument_id)
+                    && let Err(e) = ctx.data_sender.send(DataEvent::InstrumentStatus(status))
+                {
+                    log::error!("Failed to emit instrument status: {e}");
                 }
             }
             NautilusWsMessage::Error(err) => {
@@ -1122,9 +1123,9 @@ impl DydxDataClient {
                     let bar_type = *entry.value();
                     let ws_clone = ctx.ws_client.clone();
 
-                    // Re-register bar type with handler
                     let ticker = extract_raw_symbol(instrument_id.symbol.as_str());
                     let topic = format!("{ticker}/{resolution}");
+
                     if let Err(e) = ctx
                         .ws_client
                         .send_command(HandlerCommand::RegisterBarType { topic, bar_type })
@@ -1167,7 +1168,6 @@ impl DydxDataClient {
                 );
             }
             NautilusWsMessage::NewInstrumentDiscovered { ticker } => {
-                // New instrument discovered via WebSocket - fetch via HTTP and cache
                 log::info!("New instrument discovered via WebSocket: {ticker}");
 
                 let http_client = ctx.http_client.clone();
@@ -1177,11 +1177,8 @@ impl DydxDataClient {
                 get_runtime().spawn(async move {
                     match http_client.fetch_and_cache_single_instrument(&ticker).await {
                         Ok(Some(instrument)) => {
-                            // Cache in WebSocket client for future data parsing
                             ws_client.cache_instrument(instrument.clone());
                             // The InstrumentCache is already updated by fetch_and_cache_single_instrument
-
-                            // Send to data engine
                             if let Err(e) = data_sender.send(DataEvent::Instrument(instrument)) {
                                 log::error!("Failed to emit new instrument: {e}");
                             }
@@ -1203,34 +1200,31 @@ impl DydxDataClient {
         payloads: Vec<NautilusData>,
         data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
         incomplete_bars: &Arc<DashMap<BarType, Bar>>,
+        clock: &'static AtomicTime,
     ) {
         for data in payloads {
             // Filter bars through incomplete bars cache
             if let NautilusData::Bar(bar) = data {
-                Self::handle_bar_message(bar, data_sender, incomplete_bars);
+                Self::handle_bar_message(bar, data_sender, incomplete_bars, clock);
             } else if let Err(e) = data_sender.send(DataEvent::Data(data)) {
                 log::error!("Failed to emit data event: {e}");
             }
         }
     }
 
-    /// Handles bar messages by tracking incomplete bars and only emitting completed ones.
-    ///
-    /// WebSocket candle updates arrive continuously. This method:
-    /// - Caches bars where ts_event > current_time (incomplete)
-    /// - Emits bars where ts_event <= current_time (complete)
-    /// - Updates cached incomplete bars with latest data
     fn handle_bar_message(
         bar: Bar,
         data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
         incomplete_bars: &Arc<DashMap<BarType, Bar>>,
+        clock: &'static AtomicTime,
     ) {
-        let current_time_ns = get_atomic_clock_realtime().get_time_ns();
+        let current_time_ns = clock.get_time_ns();
         let bar_type = bar.bar_type;
 
         if bar.ts_event <= current_time_ns {
             // Bar is complete - emit it and remove from incomplete cache
             incomplete_bars.remove(&bar_type);
+
             if let Err(e) = data_sender.send(DataEvent::Data(NautilusData::Bar(bar))) {
                 log::error!("Failed to emit completed bar: {e}");
             }
@@ -1246,23 +1240,6 @@ impl DydxDataClient {
         }
     }
 
-    /// Resolves a crossed order book by generating synthetic deltas to uncross it.
-    ///
-    /// dYdX order books can become crossed due to:
-    /// - Validator delays in order acknowledgment across the network
-    /// - Missed or delayed WebSocket messages from the venue
-    ///
-    /// This function detects when bid_price >= ask_price and iteratively removes
-    /// the smaller side while adjusting the larger side until the book is uncrossed.
-    ///
-    /// # Algorithm
-    ///
-    /// For each crossed level:
-    /// - If bid_size > ask_size: DELETE ask, UPDATE bid (reduce by ask_size)
-    /// - If bid_size < ask_size: DELETE bid, UPDATE ask (reduce by bid_size)
-    /// - If bid_size == ask_size: DELETE both bid and ask
-    ///
-    /// The algorithm continues until no more crosses exist or the book is empty.
     fn resolve_crossed_order_book(
         book: &mut OrderBook,
         venue_deltas: OrderBookDeltas,

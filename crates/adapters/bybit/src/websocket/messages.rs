@@ -15,7 +15,10 @@
 //! WebSocket message types for Bybit public and private channels.
 
 use nautilus_model::{
-    data::{Data, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate, OrderBookDeltas},
+    data::{
+        Data, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate, OrderBookDeltas,
+        option_chain::OptionGreeks,
+    },
     events::{AccountState, OrderCancelRejected, OrderModifyRejected, OrderRejected},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
 };
@@ -122,6 +125,8 @@ pub enum NautilusWsMessage {
     OrderCancelRejected(OrderCancelRejected),
     /// Order modify rejected event (from failed amend operation).
     OrderModifyRejected(OrderModifyRejected),
+    /// Exchange-provided option Greeks from ticker data.
+    OptionGreeks(OptionGreeks),
     /// Error from venue or client.
     Error(BybitWebSocketError),
     /// WebSocket reconnected notification.
@@ -133,7 +138,7 @@ pub enum NautilusWsMessage {
 /// Represents an error event surfaced by the WebSocket client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[cfg_attr(feature = "python", pyo3::pyclass)]
+#[cfg_attr(feature = "python", pyo3::pyclass(from_py_object))]
 pub struct BybitWebSocketError {
     /// Error/return code reported by Bybit.
     pub code: i64,
@@ -173,9 +178,11 @@ impl BybitWebSocketError {
             if let Some(op) = &response.op {
                 parts.push(format!("op={op}"));
             }
+
             if let Some(topic) = &response.topic {
                 parts.push(format!("topic={topic}"));
             }
+
             if let Some(success) = response.success {
                 parts.push(format!("success={success}"));
             }

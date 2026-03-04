@@ -46,7 +46,7 @@ use nautilus_model::{
 };
 
 use crate::{
-    matching_core::{OrderMatchInfo, OrderMatchingCore},
+    matching_core::{MatchAction, OrderMatchInfo, OrderMatchingCore},
     order_manager::{
         handlers::{CancelOrderHandlerAny, ModifyOrderHandlerAny, SubmitOrderHandlerAny},
         manager::OrderManager,
@@ -227,9 +227,6 @@ impl OrderEmulator {
     ///
     /// Returns an error if no emulated orders are found or processing fails.
     ///
-    /// # Panics
-    ///
-    /// Panics if a cached client ID cannot be unwrapped.
     pub fn on_start(&mut self) -> anyhow::Result<()> {
         let emulated_orders: Vec<OrderAny> = self
             .cache
@@ -307,9 +304,6 @@ impl OrderEmulator {
         Ok(())
     }
 
-    /// # Panics
-    ///
-    /// Panics if the order cannot be converted to a passive order.
     pub fn on_event(&mut self, event: OrderEventAny) {
         log::info!("{RECV}{EVT} {event}");
 
@@ -352,8 +346,7 @@ impl OrderEmulator {
         instrument_id: InstrumentId,
         price_increment: Price,
     ) -> OrderMatchingCore {
-        let matching_core =
-            OrderMatchingCore::new(instrument_id, price_increment, None, None, None);
+        let matching_core = OrderMatchingCore::new(instrument_id, price_increment);
         self.matching_cores
             .insert(instrument_id, matching_core.clone());
         log::info!("Creating matching core for {instrument_id:?}");
@@ -415,6 +408,7 @@ impl OrderEmulator {
                     .borrow()
                     .synthetic(&trigger_instrument_id)
                     .cloned();
+
                 if let Some(synthetic) = synthetic {
                     (synthetic.id, synthetic.price_increment)
                 } else {
@@ -430,6 +424,7 @@ impl OrderEmulator {
                     .borrow()
                     .instrument(&trigger_instrument_id)
                     .cloned();
+
                 if let Some(instrument) = instrument {
                     (instrument.id(), instrument.price_increment())
                 } else {
@@ -722,6 +717,7 @@ impl OrderEmulator {
             log::error!("Cannot apply order event: {e:?}");
             return;
         }
+
         if let Err(e) = self.cache.borrow_mut().update_order(order) {
             log::error!("Cannot update order: {e:?}");
             return;
@@ -785,6 +781,7 @@ impl OrderEmulator {
         let instrument_id = &trade.instrument_id;
         if let Some(matching_core) = self.matching_cores.get_mut(instrument_id) {
             matching_core.set_last_raw(trade.price);
+
             if !self.subscribed_quotes.contains(instrument_id) {
                 matching_core.set_bid_raw(trade.price);
                 matching_core.set_ask_raw(trade.price);
@@ -800,12 +797,37 @@ impl OrderEmulator {
     }
 
     fn iterate_orders(&mut self, instrument_id: &InstrumentId) {
-        let orders = if let Some(matching_core) = self.matching_cores.get_mut(instrument_id) {
-            matching_core.iterate();
-
-            matching_core.get_orders()
+        // Process bid actions before ask actions so cross-side
+        // contingencies (OCO/OUO) mutate state between sides
+        let bid_actions = if let Some(matching_core) = self.matching_cores.get_mut(instrument_id) {
+            matching_core.iterate_bids()
         } else {
             log::error!("Cannot iterate orders: no matching core for instrument {instrument_id}");
+            return;
+        };
+        for action in bid_actions {
+            match action {
+                MatchAction::FillLimit(id) => self.fill_limit_order(id),
+                MatchAction::TriggerStop(id) => self.trigger_stop_order(id),
+            }
+        }
+
+        let ask_actions = if let Some(matching_core) = self.matching_cores.get_mut(instrument_id) {
+            matching_core.iterate_asks()
+        } else {
+            return;
+        };
+        for action in ask_actions {
+            match action {
+                MatchAction::FillLimit(id) => self.fill_limit_order(id),
+                MatchAction::TriggerStop(id) => self.trigger_stop_order(id),
+            }
+        }
+
+        // Re-snapshot orders after actions to avoid stale trailing stop updates
+        let orders = if let Some(matching_core) = self.matching_cores.get(instrument_id) {
+            matching_core.get_orders()
+        } else {
             return;
         };
 
@@ -835,9 +857,6 @@ impl OrderEmulator {
         }
     }
 
-    /// # Panics
-    ///
-    /// Panics if the order cannot be converted to a passive order.
     pub fn cancel_order(&mut self, order: &OrderAny) {
         log::info!("Canceling order {}", order.client_order_id());
 
@@ -1256,6 +1275,7 @@ impl OrderEmulator {
                 bid.get_or_insert(q.bid_price);
                 ask.get_or_insert(q.ask_price);
             }
+
             if let Some(t) = self.cache.borrow().trade(&matching_core.instrument_id) {
                 last.get_or_insert(t.price);
             }
@@ -1303,6 +1323,7 @@ impl OrderEmulator {
             log::error!("Failed to apply order event: {e}");
             return;
         }
+
         if let Err(e) = self.cache.borrow_mut().update_order(order) {
             log::error!("Failed to update order in cache: {e}");
             return;
@@ -1415,7 +1436,7 @@ mod tests {
     fn add_instrument_to_cache(cache: &Rc<RefCell<Cache>>, instrument: &CryptoPerpetual) {
         cache
             .borrow_mut()
-            .add_instrument(InstrumentAny::CryptoPerpetual(*instrument))
+            .add_instrument(InstrumentAny::CryptoPerpetual(instrument.clone()))
             .unwrap();
     }
 

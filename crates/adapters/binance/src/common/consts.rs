@@ -76,8 +76,7 @@ pub const BINANCE_SPOT_SBE_WS_API_URL: &str =
     "wss://ws-api.binance.com:443/ws-api/v3?responseFormat=sbe&sbeSchemaId=3&sbeSchemaVersion=2";
 
 /// Binance Spot SBE WebSocket API URL (testnet).
-pub const BINANCE_SPOT_SBE_WS_API_TESTNET_URL: &str =
-    "wss://testnet.binance.vision/ws-api/v3?responseFormat=sbe&sbeSchemaId=3&sbeSchemaVersion=2";
+pub const BINANCE_SPOT_SBE_WS_API_TESTNET_URL: &str = "wss://ws-api.testnet.binance.vision/ws-api/v3?responseFormat=sbe&sbeSchemaId=3&sbeSchemaVersion=2";
 
 /// Binance Spot SBE WebSocket API URL (demo).
 pub const BINANCE_SPOT_SBE_WS_API_DEMO_URL: &str =
@@ -223,15 +222,17 @@ pub const BINANCE_EAPI_RATE_LIMITS: &[BinanceRateLimitQuota] = &[
 /// WebSocket subscription rate limit: 5 messages per second.
 ///
 /// Binance limits incoming WebSocket messages (subscribe/unsubscribe) to 5 per second.
-pub static BINANCE_WS_SUBSCRIPTION_QUOTA: LazyLock<Quota> =
-    LazyLock::new(|| Quota::per_second(NonZeroU32::new(5).expect("5 > 0")));
+pub static BINANCE_WS_SUBSCRIPTION_QUOTA: LazyLock<Quota> = LazyLock::new(|| {
+    Quota::per_second(NonZeroU32::new(5).expect("non-zero")).expect("valid constant")
+});
 
 /// WebSocket connection rate limit: 1 per second (conservative).
 ///
 /// Binance limits connections to 300 per 5 minutes per IP. This conservative quota
 /// of 1 per second helps avoid hitting the connection limit during reconnection storms.
-pub static BINANCE_WS_CONNECTION_QUOTA: LazyLock<Quota> =
-    LazyLock::new(|| Quota::per_second(NonZeroU32::new(1).expect("1 > 0")));
+pub static BINANCE_WS_CONNECTION_QUOTA: LazyLock<Quota> = LazyLock::new(|| {
+    Quota::per_second(NonZeroU32::new(1).expect("non-zero")).expect("valid constant")
+});
 
 /// Pre-interned rate limit key for WebSocket subscription operations.
 pub static BINANCE_RATE_LIMIT_KEY_SUBSCRIPTION: LazyLock<[Ustr; 1]> =

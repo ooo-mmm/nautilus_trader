@@ -22,17 +22,21 @@ use std::{
 
 use dashmap::DashMap;
 use nautilus_common::live::get_runtime;
-use nautilus_core::{UUID4, python::to_pyvalue_err, time::get_atomic_clock_realtime};
+use nautilus_core::{
+    UUID4,
+    python::{call_python_threadsafe, to_pyvalue_err},
+    time::get_atomic_clock_realtime,
+};
 use nautilus_model::{
-    data::BarType,
+    data::{BarType, Data, OrderBookDeltas_API},
     enums::AccountType,
     events::AccountState,
     identifiers::{AccountId, InstrumentId},
-    python::instruments::pyobject_to_instrument_any,
+    python::{data::data_to_pycapsule, instruments::pyobject_to_instrument_any},
     types::{AccountBalance, Currency, Money},
 };
 use nautilus_network::mode::ConnectionMode;
-use pyo3::{IntoPyObjectExt, prelude::*};
+use pyo3::{IntoPyObjectExt, prelude::*, types::PyDict};
 
 use crate::{
     common::{credential::DydxCredential, enums::DydxCandleResolution, parse::extract_raw_symbol},
@@ -42,15 +46,10 @@ use crate::{
     websocket::{
         client::DydxWebSocketClient,
         enums::NautilusWsMessage,
-        error::DydxWsError,
         handler::HandlerCommand,
         parse::{parse_ws_fill_report, parse_ws_order_report, parse_ws_position_report},
     },
 };
-
-fn to_pyvalue_err_dydx(e: DydxWsError) -> PyErr {
-    pyo3::exceptions::PyValueError::new_err(e.to_string())
-}
 
 #[pymethods]
 impl DydxWebSocketClient {
@@ -119,30 +118,29 @@ impl DydxWebSocketClient {
     fn py_connect<'py>(
         &mut self,
         py: Python<'py>,
+        loop_: Py<PyAny>,
         instruments: Vec<Py<PyAny>>,
         callback: Py<PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        // Convert Python instruments to Rust InstrumentAny
+        let call_soon = loop_.getattr(py, "call_soon_threadsafe")?;
+
         let mut instruments_any = Vec::new();
         for inst in instruments {
             let inst_any = pyobject_to_instrument_any(py, inst)?;
             instruments_any.push(inst_any);
         }
 
-        // Cache instruments first
         self.cache_instruments(instruments_any);
 
         let mut client = self.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            // Connect the WebSocket client
-            client.connect().await.map_err(to_pyvalue_err_dydx)?;
+            client.connect().await.map_err(to_pyvalue_err)?;
 
-            // Take the receiver for messages
             if let Some(mut rx) = client.take_receiver() {
-                // Spawn task to process messages and call Python callback
                 get_runtime().spawn(async move {
                     let _client = client; // Keep client alive in spawned task
+                    let clock = get_atomic_clock_realtime();
                     let order_contexts: DashMap<u32, OrderContext> = DashMap::new();
                     let order_id_map: DashMap<String, (u32, u32)> = DashMap::new();
 
@@ -151,54 +149,41 @@ impl DydxWebSocketClient {
                             NautilusWsMessage::Data(items) => {
                                 Python::attach(|py| {
                                     for data in items {
-                                        use nautilus_model::python::data::data_to_pycapsule;
                                         let py_obj = data_to_pycapsule(py, data);
-                                        if let Err(e) = callback.call1(py, (py_obj,)) {
-                                            log::error!("Error calling Python callback: {e}");
-                                        }
+                                        call_python_threadsafe(py, &call_soon, &callback, py_obj);
                                     }
                                 });
                             }
                             NautilusWsMessage::Deltas(deltas) => {
                                 Python::attach(|py| {
-                                    use nautilus_model::{
-                                        data::{Data, OrderBookDeltas_API},
-                                        python::data::data_to_pycapsule,
-                                    };
                                     let data = Data::Deltas(OrderBookDeltas_API::new(*deltas));
                                     let py_obj = data_to_pycapsule(py, data);
-                                    if let Err(e) = callback.call1(py, (py_obj,)) {
-                                        log::error!("Error calling Python callback: {e}");
-                                    }
+                                    call_python_threadsafe(py, &call_soon, &callback, py_obj);
                                 });
                             }
                             NautilusWsMessage::BlockHeight { height, time } => {
                                 Python::attach(|py| {
-                                    use pyo3::types::PyDict;
                                     let dict = PyDict::new(py);
                                     let _ = dict.set_item("type", "block_height");
                                     let _ = dict.set_item("height", height);
                                     let _ = dict.set_item("time", time.to_rfc3339());
-                                    if let Err(e) = callback.call1(py, (dict,)) {
-                                        log::error!("Error calling Python callback for block_height: {e}");
+                                    if let Ok(py_obj) = dict.into_py_any(py) {
+                                        call_python_threadsafe(py, &call_soon, &callback, py_obj);
                                     }
                                 });
                             }
                             NautilusWsMessage::SubaccountSubscribed(data) => {
-                                // Get account_id from the client
                                 let Some(account_id) = _client.account_id() else {
                                     log::warn!("Cannot parse subaccount subscription: account_id not set");
                                     continue;
                                 };
 
                                 let instrument_cache = _client.instrument_cache();
-                                let ts_init = get_atomic_clock_realtime().get_time_ns();
+                                let ts_init = clock.get_time_ns();
 
-                                // Build maps from instrument cache
                                 let inst_map = instrument_cache.to_instrument_id_map();
                                 let oracle_map = instrument_cache.to_oracle_prices_map();
 
-                                // Parse and emit AccountState + PositionStatusReports
                                 if let Some(ref subaccount) = data.contents.subaccount {
                                     match parse_account_state(
                                         subaccount,
@@ -212,9 +197,7 @@ impl DydxWebSocketClient {
                                             Python::attach(|py| {
                                                 match account_state.into_py_any(py) {
                                                     Ok(py_obj) => {
-                                                        if let Err(e) = callback.call1(py, (py_obj,)) {
-                                                            log::error!("Error calling Python callback for AccountState: {e}");
-                                                        }
+                                                        call_python_threadsafe(py, &call_soon, &callback, py_obj);
                                                     }
                                                     Err(e) => log::error!("Failed to convert AccountState to Python: {e}"),
                                                 }
@@ -223,7 +206,6 @@ impl DydxWebSocketClient {
                                     Err(e) => log::error!("Failed to parse account state: {e}"),
                                 }
 
-                                // Parse and emit PositionStatusReports
                                 if let Some(ref positions) = subaccount.open_perpetual_positions {
                                     for (market, ws_position) in positions {
                                         match parse_ws_position_report(
@@ -236,9 +218,7 @@ impl DydxWebSocketClient {
                                                 Python::attach(|py| {
                                                     match pyo3::Py::new(py, report) {
                                                         Ok(py_obj) => {
-                                                            if let Err(e) = callback.call1(py, (py_obj.into_any(),)) {
-                                                                log::error!("Error calling Python callback for PositionStatusReport: {e}");
-                                                            }
+                                                            call_python_threadsafe(py, &call_soon, &callback, py_obj.into_any());
                                                         }
                                                         Err(e) => log::error!("Failed to convert PositionStatusReport to Python: {e}"),
                                                     }
@@ -270,9 +250,7 @@ impl DydxWebSocketClient {
                                     Python::attach(|py| {
                                         match account_state.into_py_any(py) {
                                             Ok(py_obj) => {
-                                                if let Err(e) = callback.call1(py, (py_obj,)) {
-                                                    log::error!("Error calling Python callback for AccountState: {e}");
-                                                }
+                                                call_python_threadsafe(py, &call_soon, &callback, py_obj);
                                             }
                                             Err(e) => log::error!("Failed to convert AccountState to Python: {e}"),
                                         }
@@ -287,7 +265,7 @@ impl DydxWebSocketClient {
 
                                 let instrument_cache = _client.instrument_cache();
                                 let encoder = _client.encoder();
-                                let ts_init = get_atomic_clock_realtime().get_time_ns();
+                                let ts_init = clock.get_time_ns();
 
                                 let mut terminal_orders: Vec<(u32, u32, String)> = Vec::new();
 
@@ -295,6 +273,7 @@ impl DydxWebSocketClient {
                                 // but DON'T send order reports yet — fills must be sent first
                                 // to prevent reconciliation from inferring fills at the limit price.
                                 let mut pending_order_reports = Vec::new();
+
                                 if let Some(ref orders) = data.contents.orders {
                                     for ws_order in orders {
                                         // Build order_id → (client_id, client_metadata) for fill correlation
@@ -348,9 +327,7 @@ impl DydxWebSocketClient {
                                                 Python::attach(|py| {
                                                     match pyo3::Py::new(py, report) {
                                                         Ok(py_obj) => {
-                                                            if let Err(e) = callback.call1(py, (py_obj.into_any(),)) {
-                                                                log::error!("Error calling callback for FillReport: {e}");
-                                                            }
+                                                            call_python_threadsafe(py, &call_soon, &callback, py_obj.into_any());
                                                         }
                                                         Err(e) => log::error!("Failed to convert FillReport: {e}"),
                                                     }
@@ -366,9 +343,7 @@ impl DydxWebSocketClient {
                                     Python::attach(|py| {
                                         match pyo3::Py::new(py, report) {
                                             Ok(py_obj) => {
-                                                if let Err(e) = callback.call1(py, (py_obj.into_any(),)) {
-                                                    log::error!("Error calling callback for OrderStatusReport: {e}");
-                                                }
+                                                call_python_threadsafe(py, &call_soon, &callback, py_obj.into_any());
                                             }
                                             Err(e) => log::error!("Failed to convert OrderStatusReport: {e}"),
                                         }
@@ -386,9 +361,7 @@ impl DydxWebSocketClient {
                                 Python::attach(|py| {
                                     match mark_price.into_py_any(py) {
                                         Ok(py_obj) => {
-                                            if let Err(e) = callback.call1(py, (py_obj,)) {
-                                                log::error!("Error calling Python callback for MarkPriceUpdate: {e}");
-                                            }
+                                            call_python_threadsafe(py, &call_soon, &callback, py_obj);
                                         }
                                         Err(e) => log::error!("Failed to convert MarkPriceUpdate to Python: {e}"),
                                     }
@@ -398,9 +371,7 @@ impl DydxWebSocketClient {
                                 Python::attach(|py| {
                                     match index_price.into_py_any(py) {
                                         Ok(py_obj) => {
-                                            if let Err(e) = callback.call1(py, (py_obj,)) {
-                                                log::error!("Error calling Python callback for IndexPriceUpdate: {e}");
-                                            }
+                                            call_python_threadsafe(py, &call_soon, &callback, py_obj);
                                         }
                                         Err(e) => log::error!("Failed to convert IndexPriceUpdate to Python: {e}"),
                                     }
@@ -410,11 +381,19 @@ impl DydxWebSocketClient {
                                 Python::attach(|py| {
                                     match funding_rate.into_py_any(py) {
                                         Ok(py_obj) => {
-                                            if let Err(e) = callback.call1(py, (py_obj,)) {
-                                                log::error!("Error calling Python callback for FundingRateUpdate: {e}");
-                                            }
+                                            call_python_threadsafe(py, &call_soon, &callback, py_obj);
                                         }
                                         Err(e) => log::error!("Failed to convert FundingRateUpdate to Python: {e}"),
+                                    }
+                                });
+                            }
+                            NautilusWsMessage::InstrumentStatus(status) => {
+                                Python::attach(|py| {
+                                    match status.into_py_any(py) {
+                                        Ok(py_obj) => {
+                                            call_python_threadsafe(py, &call_soon, &callback, py_obj);
+                                        }
+                                        Err(e) => log::error!("Failed to convert InstrumentStatus to Python: {e}"),
                                     }
                                 });
                             }
@@ -428,9 +407,7 @@ impl DydxWebSocketClient {
                                 Python::attach(|py| {
                                     match state.into_py_any(py) {
                                         Ok(py_obj) => {
-                                            if let Err(e) = callback.call1(py, (py_obj,)) {
-                                                log::error!("Error calling Python callback for AccountState: {e}");
-                                            }
+                                            call_python_threadsafe(py, &call_soon, &callback, py_obj);
                                         }
                                         Err(e) => log::error!("Failed to convert AccountState to Python: {e}"),
                                     }
@@ -440,9 +417,7 @@ impl DydxWebSocketClient {
                                 Python::attach(|py| {
                                     match pyo3::Py::new(py, *report) {
                                         Ok(py_obj) => {
-                                            if let Err(e) = callback.call1(py, (py_obj.into_any(),)) {
-                                                log::error!("Error calling Python callback for PositionStatusReport: {e}");
-                                            }
+                                            call_python_threadsafe(py, &call_soon, &callback, py_obj.into_any());
                                         }
                                         Err(e) => log::error!("Failed to convert PositionStatusReport to Python: {e}"),
                                     }
@@ -452,9 +427,7 @@ impl DydxWebSocketClient {
                                 Python::attach(|py| {
                                     match pyo3::Py::new(py, *report) {
                                         Ok(py_obj) => {
-                                            if let Err(e) = callback.call1(py, (py_obj.into_any(),)) {
-                                                log::error!("Error calling Python callback for OrderStatusReport: {e}");
-                                            }
+                                            call_python_threadsafe(py, &call_soon, &callback, py_obj.into_any());
                                         }
                                         Err(e) => log::error!("Failed to convert OrderStatusReport to Python: {e}"),
                                     }
@@ -464,9 +437,7 @@ impl DydxWebSocketClient {
                                 Python::attach(|py| {
                                     match pyo3::Py::new(py, *report) {
                                         Ok(py_obj) => {
-                                            if let Err(e) = callback.call1(py, (py_obj.into_any(),)) {
-                                                log::error!("Error calling Python callback for FillReport: {e}");
-                                            }
+                                            call_python_threadsafe(py, &call_soon, &callback, py_obj.into_any());
                                         }
                                         Err(e) => log::error!("Failed to convert FillReport to Python: {e}"),
                                     }
@@ -475,12 +446,11 @@ impl DydxWebSocketClient {
                             NautilusWsMessage::NewInstrumentDiscovered { ticker } => {
                                 log::info!("New instrument discovered via WebSocket: {ticker}");
                                 Python::attach(|py| {
-                                    use pyo3::types::PyDict;
                                     let dict = PyDict::new(py);
                                     let _ = dict.set_item("type", "new_instrument_discovered");
                                     let _ = dict.set_item("ticker", &ticker);
-                                    if let Err(e) = callback.call1(py, (dict,)) {
-                                        log::error!("Error calling Python callback for new_instrument_discovered: {e}");
+                                    if let Ok(py_obj) = dict.into_py_any(py) {
+                                        call_python_threadsafe(py, &call_soon, &callback, py_obj);
                                     }
                                 });
                             }
@@ -497,7 +467,7 @@ impl DydxWebSocketClient {
     fn py_disconnect<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let mut client = self.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            client.disconnect().await.map_err(to_pyvalue_err_dydx)?;
+            client.disconnect().await.map_err(to_pyvalue_err)?;
             Ok(())
         })
     }
@@ -573,7 +543,7 @@ impl DydxWebSocketClient {
             client
                 .subscribe_trades(instrument_id)
                 .await
-                .map_err(to_pyvalue_err_dydx)?;
+                .map_err(to_pyvalue_err)?;
             Ok(())
         })
     }
@@ -589,7 +559,7 @@ impl DydxWebSocketClient {
             client
                 .unsubscribe_trades(instrument_id)
                 .await
-                .map_err(to_pyvalue_err_dydx)?;
+                .map_err(to_pyvalue_err)?;
             Ok(())
         })
     }
@@ -605,7 +575,7 @@ impl DydxWebSocketClient {
             client
                 .subscribe_orderbook(instrument_id)
                 .await
-                .map_err(to_pyvalue_err_dydx)?;
+                .map_err(to_pyvalue_err)?;
             Ok(())
         })
     }
@@ -621,7 +591,7 @@ impl DydxWebSocketClient {
             client
                 .unsubscribe_orderbook(instrument_id)
                 .await
-                .map_err(to_pyvalue_err_dydx)?;
+                .map_err(to_pyvalue_err)?;
             Ok(())
         })
     }
@@ -647,7 +617,7 @@ impl DydxWebSocketClient {
             // Register bar type in handler before subscribing
             client
                 .send_command(HandlerCommand::RegisterBarType { topic, bar_type })
-                .map_err(to_pyvalue_err_dydx)?;
+                .map_err(to_pyvalue_err)?;
 
             // Brief delay to ensure handler processes registration
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -655,7 +625,7 @@ impl DydxWebSocketClient {
             client
                 .subscribe_candles(instrument_id, &resolution)
                 .await
-                .map_err(to_pyvalue_err_dydx)?;
+                .map_err(to_pyvalue_err)?;
             Ok(())
         })
     }
@@ -681,12 +651,12 @@ impl DydxWebSocketClient {
             client
                 .unsubscribe_candles(instrument_id, &resolution)
                 .await
-                .map_err(to_pyvalue_err_dydx)?;
+                .map_err(to_pyvalue_err)?;
 
             // Unregister bar type after unsubscribing
             client
                 .send_command(HandlerCommand::UnregisterBarType { topic })
-                .map_err(to_pyvalue_err_dydx)?;
+                .map_err(to_pyvalue_err)?;
 
             Ok(())
         })
@@ -696,10 +666,7 @@ impl DydxWebSocketClient {
     fn py_subscribe_markets<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            client
-                .subscribe_markets()
-                .await
-                .map_err(to_pyvalue_err_dydx)?;
+            client.subscribe_markets().await.map_err(to_pyvalue_err)?;
             Ok(())
         })
     }
@@ -708,10 +675,7 @@ impl DydxWebSocketClient {
     fn py_unsubscribe_markets<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            client
-                .unsubscribe_markets()
-                .await
-                .map_err(to_pyvalue_err_dydx)?;
+            client.unsubscribe_markets().await.map_err(to_pyvalue_err)?;
             Ok(())
         })
     }
@@ -728,7 +692,7 @@ impl DydxWebSocketClient {
             client
                 .subscribe_subaccount(&address, subaccount_number)
                 .await
-                .map_err(to_pyvalue_err_dydx)?;
+                .map_err(to_pyvalue_err)?;
             Ok(())
         })
     }
@@ -745,7 +709,7 @@ impl DydxWebSocketClient {
             client
                 .unsubscribe_subaccount(&address, subaccount_number)
                 .await
-                .map_err(to_pyvalue_err_dydx)?;
+                .map_err(to_pyvalue_err)?;
             Ok(())
         })
     }
@@ -757,7 +721,7 @@ impl DydxWebSocketClient {
             client
                 .subscribe_block_height()
                 .await
-                .map_err(to_pyvalue_err_dydx)?;
+                .map_err(to_pyvalue_err)?;
             Ok(())
         })
     }
@@ -769,7 +733,7 @@ impl DydxWebSocketClient {
             client
                 .unsubscribe_block_height()
                 .await
-                .map_err(to_pyvalue_err_dydx)?;
+                .map_err(to_pyvalue_err)?;
             Ok(())
         })
     }
